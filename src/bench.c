@@ -58,7 +58,7 @@ enum bench_way {
 #define POSITION_COUNT 4
 #define WAY_COUNT 3
 
-static int engine_bench_run(const char *data_dir, int64_t record_count);
+static int records_bench_run(const char *data_dir, int64_t record_count);
 static int nodes_bench_run(int64_t key_count);
 static bool count_parse(const char *text, int64_t *count);
 static double clock_now(void);
@@ -85,7 +85,7 @@ int main(int argc, char **argv)
 
     if (argc == ARGUMENT_COUNT + 1 && strcmp(argv[1], "engine") == 0 &&
         count_parse(argv[3], &count)) {
-        return engine_bench_run(argv[2], count) == 0 ? 0 : 1;
+        return records_bench_run(argv[2], count) == 0 ? 0 : 1;
     }
     if (argc == ARGUMENT_COUNT && strcmp(argv[1], "nodes") == 0 &&
         count_parse(argv[2], &count)) {
@@ -99,7 +99,7 @@ int main(int argc, char **argv)
 
 /* 엔진 준비 시간(테이블 파일을 읽어 다음 ID와 B+ 트리를 만드는 시간)은
    따로 적고, 질의 시간은 준비가 끝난 뒤부터 잽니다. */
-static int engine_bench_run(const char *data_dir, int64_t record_count)
+static int records_bench_run(const char *data_dir, int64_t record_count)
 {
     static const char *const way_names[WAY_COUNT] = {"id", "email",
                                                      "forced-scan"};

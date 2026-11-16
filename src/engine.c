@@ -36,13 +36,14 @@ struct engine {
     size_t table_lock_count;
 };
 
-static int engine_lock_data_dir(struct engine *engine, const char *data_dir,
-                                char *error, size_t error_size);
-static int engine_load_tables(struct engine *engine, const char *data_dir,
-                              char *error, size_t error_size);
-static int engine_add_table(struct engine *engine, struct table *table);
-static int engine_init_table_locks(struct engine *engine, char *error,
-                                   size_t error_size);
+static int data_dir_lock(struct engine *engine, const char *data_dir,
+                         char *error, size_t error_size);
+static int tables_load(struct engine *engine, const char *data_dir, char *error,
+                       size_t error_size);
+static int table_add(struct engine *engine, struct table *table);
+static int table_locks_create(struct engine *engine, char *error,
+                              size_t error_size);
+static void table_locks_destroy(struct engine *engine);
 static struct engine_result *execute_statement(struct engine *engine,
                                                const char *sql,
                                                const char **next_sql,
@@ -66,9 +67,9 @@ static void result_fail(struct engine_result *result,
                         enum engine_error_reason code, const char *format, ...);
 static void result_set_sql_error(struct engine_result *result,
                                  const struct sql_error *sql_error);
-static bool sql_rest_is_blank(const char *sql);
-static bool engine_find_table(const struct engine *engine, const char *name,
-                              size_t *table_index);
+static bool next_sql_is_blank(const char *sql);
+static bool table_find(const struct engine *engine, const char *name,
+                       size_t *table_index);
 static void execute_insert(struct table *table,
                            const struct statement *statement,
                            struct engine_result *result);
@@ -127,9 +128,9 @@ struct engine *engine_create(const char *data_dir,
     engine->lock_fd = -1;
     /* 다른 프로세스가 같은 파일을 쓰는 중에 읽지 않도록, 스키마와 테이블
        파일을 읽기 전에 잠급니다. */
-    if (engine_lock_data_dir(engine, data_dir, error, error_size) != 0 ||
-        engine_load_tables(engine, data_dir, error, error_size) != 0 ||
-        engine_init_table_locks(engine, error, error_size) != 0) {
+    if (data_dir_lock(engine, data_dir, error, error_size) != 0 ||
+        tables_load(engine, data_dir, error, error_size) != 0 ||
+        table_locks_create(engine, error, error_size) != 0) {
         engine_destroy(engine);
         return NULL;
     }
@@ -178,7 +179,7 @@ static struct engine_result *execute_statement(struct engine *engine,
     }
     /* API 모드는 요청 하나에 문장 하나입니다. 일부만 실행하지 않도록 첫
        문장도 실행하기 전에 거절합니다. */
-    if (next_sql == NULL && !sql_rest_is_blank(statement_end)) {
+    if (next_sql == NULL && !next_sql_is_blank(statement_end)) {
         result_fail(result, ENGINE_REASON_MULTIPLE_STATEMENTS,
                     "요청 하나에는 SQL 문장 하나만 보냅니다");
         sql_statement_destroy(statement);
@@ -191,7 +192,7 @@ static struct engine_result *execute_statement(struct engine *engine,
         result->kind = ENGINE_STATEMENT_INSERT;
         result_fail(result, ENGINE_REASON_INVALID_CURSOR,
                     "INSERT에는 커서를 붙이지 않습니다");
-    } else if (engine_find_table(engine, statement->table, &table_index)) {
+    } else if (table_find(engine, statement->table, &table_index)) {
         execute_on_table(engine, table_index, statement, cursor, result);
     } else {
         result_fail(result, ENGINE_REASON_NO_TABLE, "없는 테이블입니다: %s",
@@ -224,10 +225,7 @@ void engine_destroy(struct engine *engine)
         table_destroy(engine->tables[i]);
     }
     free(engine->tables);
-    for (size_t i = 0; i < engine->table_lock_count; i++) {
-        rwlock_destroy(&engine->table_locks[i]);
-    }
-    free(engine->table_locks);
+    table_locks_destroy(engine);
     if (engine->lock_fd >= 0) {
         close(engine->lock_fd);
     }
@@ -237,8 +235,8 @@ void engine_destroy(struct engine *engine)
 /* 데이터 폴더의 잠금 파일에 비차단 배타 flock을 겁니다. flock은 열린 파일마다
    잠그므로 같은 프로세스의 두 번째 엔진도 실패하고, 프로세스가 끝나면 커널이
    잠금을 풉니다. */
-static int engine_lock_data_dir(struct engine *engine, const char *data_dir,
-                                char *error, size_t error_size)
+static int data_dir_lock(struct engine *engine, const char *data_dir,
+                         char *error, size_t error_size)
 {
     char path[LOCK_PATH_BYTES];
 
@@ -261,8 +259,8 @@ static int engine_lock_data_dir(struct engine *engine, const char *data_dir,
 }
 
 /* 데이터 폴더의 <테이블>.schema마다 테이블 하나를 엽니다. */
-static int engine_load_tables(struct engine *engine, const char *data_dir,
-                              char *error, size_t error_size)
+static int tables_load(struct engine *engine, const char *data_dir, char *error,
+                       size_t error_size)
 {
     DIR *dir = opendir(data_dir);
     struct dirent *entry;
@@ -287,7 +285,7 @@ static int engine_load_tables(struct engine *engine, const char *data_dir,
                     ? NULL
                     : table_create(data_dir, table_name, error, error_size);
         free(table_name);
-        if (table == NULL || engine_add_table(engine, table) != 0) {
+        if (table == NULL || table_add(engine, table) != 0) {
             table_destroy(table);
             status = -1;
         }
@@ -297,7 +295,7 @@ static int engine_load_tables(struct engine *engine, const char *data_dir,
     return status;
 }
 
-static int engine_add_table(struct engine *engine, struct table *table)
+static int table_add(struct engine *engine, struct table *table)
 {
     struct table **tables = realloc(
         engine->tables, (engine->table_count + 1) * sizeof(*engine->tables));
@@ -314,8 +312,8 @@ static int engine_add_table(struct engine *engine, struct table *table)
 /* 테이블마다 쓰기 우선 잠금 하나를 만듭니다. 테이블을 다 읽은 뒤에 한 번에
    할당합니다. 테이블 배열처럼 realloc하면 이미 초기화한 mutex가 옮겨지기
    때문입니다. */
-static int engine_init_table_locks(struct engine *engine, char *error,
-                                   size_t error_size)
+static int table_locks_create(struct engine *engine, char *error,
+                              size_t error_size)
 {
     if (engine->table_count == 0) {
         return 0;
@@ -334,6 +332,15 @@ static int engine_init_table_locks(struct engine *engine, char *error,
         engine->table_lock_count++;
     }
     return 0;
+}
+
+/* table_locks_create가 초기화한 잠금만 해제합니다. */
+static void table_locks_destroy(struct engine *engine)
+{
+    for (size_t i = 0; i < engine->table_lock_count; i++) {
+        rwlock_destroy(&engine->table_locks[i]);
+    }
+    free(engine->table_locks);
 }
 
 /* 검증은 잠금 밖에서 하고 실행 단계만 잠금 안에서 합니다. 스키마는 시작
@@ -485,7 +492,7 @@ static void result_set_sql_error(struct engine_result *result,
 }
 
 /* 파서가 문장 사이에서 건너뛰는 공백과 같은 isspace로 봅니다. */
-static bool sql_rest_is_blank(const char *sql)
+static bool next_sql_is_blank(const char *sql)
 {
     while (isspace((unsigned char)*sql)) {
         sql++;
@@ -493,8 +500,8 @@ static bool sql_rest_is_blank(const char *sql)
     return *sql == '\0';
 }
 
-static bool engine_find_table(const struct engine *engine, const char *name,
-                              size_t *table_index)
+static bool table_find(const struct engine *engine, const char *name,
+                       size_t *table_index)
 {
     for (size_t i = 0; i < engine->table_count; i++) {
         if (strcmp(engine->tables[i]->name, name) == 0) {

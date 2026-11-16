@@ -250,7 +250,7 @@ main                                [이벤트 루프 스레드]
                                ▼
 엔진 (src/engine.c)  execute_statement
  ├ sql_parse (src/sql.c)                       잠금 밖: 토크나이저, 파서
- └ engine_find_table → execute_on_table
+ └ table_find → execute_on_table
     ├ insert_check / select_check → select_plan
     │                                          잠금 밖: 스키마 검증, 접근 경로
     └ execute_locked
@@ -265,8 +265,8 @@ main                                [이벤트 루프 스레드]
                                ▼
 데이터 폴더: <테이블>.schema, <테이블>.tbl, .lock
 
-시작할 때: engine_create → engine_lock_data_dir(flock)
-           → engine_load_tables → table_create → table_records_load
+시작할 때: engine_create → data_dir_lock(flock)
+           → tables_load → table_create → table_records_load
              (잘림과 손상 판정, 다음 ID, B+ 트리 다시 만들기)
 ```
 
