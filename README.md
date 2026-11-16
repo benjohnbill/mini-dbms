@@ -131,14 +131,14 @@ PR을 올리거나 고칠 때마다 GitHub Actions가 `make verify`를 실행합
 
 ## API
 
-Phase 3에서 외부 클라이언트가 DBMS를 부르는 방법입니다. `POST /query`에 SQL 문장 하나를 본문으로 보내고 JSON을 받는 HTTP/1.1 API입니다(`docs/prd/final.md` § Phase 3). 본문 길이, 빈 본문, keep-alive, 결과 상한, 종료는 티켓 11\~13이 이 절에 더합니다.
+Phase 3에서 외부 클라이언트가 DBMS를 부르는 방법입니다. `POST /query`에 SQL 문장 하나를 본문으로 보내고 JSON을 받는 HTTP/1.1 API입니다(`docs/prd/final.md` § Phase 3). 종료와 큰 결과 나눠 받기(커서)는 티켓 12, 13이 이 절에 더합니다.
 
 ### 서버 실행
 
 `make`가 CLI와 함께 API 서버(`build/mini-dbms-server`)를 빌드합니다. 서버는 CLI와 같은 데이터 폴더를 씁니다. 엔진이 데이터 폴더를 잠그므로 서버가 도는 동안 같은 폴더로 CLI를 실행할 수 없습니다.
 
 ```text
-mini-dbms-server [--data 폴더] [--host 주소] [--port 포트] [--threads 수] [--queue 수]
+mini-dbms-server [--data 폴더] [--host 주소] [--port 포트] [--threads 수] [--queue 수] [--idle-timeout 밀리초]
 ```
 
 | 인자 | 기본값 | 뜻 |
@@ -147,7 +147,8 @@ mini-dbms-server [--data 폴더] [--host 주소] [--port 포트] [--threads 수]
 | `--host` | `127.0.0.1` | 연결을 받을 주소. 시연용입니다. 서버에는 인증이 없으므로, 다른 주소를 열면 그 주소에 닿는 누구나 SQL을 실행합니다 |
 | `--port` | `8080` | 포트 |
 | `--threads` | `8` | 작업 스레드 수 |
-| `--queue` | `128` | 작업 대기열 칸 수 |
+| `--queue` | `128` | 작업 대기열 칸 수. `0`이면 모든 SQL 요청을 `503 queue_full`로 거절합니다 |
+| `--idle-timeout` | `30000` | 주고받은 바이트가 없는 연결을 서버가 닫기까지의 밀리초. 응답을 기다리는 연결은 닫지 않습니다 |
 
 `make functional`은 이 서버를 띄워 실제 HTTP 요청을 보내는 기능 테스트도 실행하고, `make tsan`은 ThreadSanitizer로 빌드한 서버로 같은 테스트를 다시 돌립니다. 잘못된 인자는 사용법을 stderr에 쓰고 종료 코드 2로 끝납니다. 엔진을 만들지 못하거나 포트를 열지 못하면 종료 코드 1입니다.
 
@@ -162,11 +163,23 @@ curl --data-binary 'SELECT * FROM users WHERE id = 1;' http://127.0.0.1:8080/que
 
 ### 요청 처리 흐름
 
-이벤트 루프 스레드 하나가 Mongoose로 연결을 받고, 헤더와 본문을 다 받은 요청의 SQL만 복사해 작업 대기열에 넣습니다. 작업 스레드는 대기열에서 요청을 꺼내 엔진을 API 모드(다음 문장 위치 없이)로 부르고, 만든 JSON을 완료 대기열에 넣은 뒤 `mg_wakeup()`으로 이벤트 루프를 깨우기만 합니다. 응답은 이벤트 루프만 보냅니다. 이벤트 루프는 poll마다 완료 대기열을 비우고, 그 사이 연결이 끊긴 요청의 결과는 해제합니다. 받은 INSERT는 연결이 끊겨도 끝까지 실행합니다.
+이벤트 루프 스레드 하나가 Mongoose로 연결을 받고, 받은 바이트에서 요청을 직접 잘라 헤더와 본문 길이를 검사한 뒤, 본문을 다 받은 요청의 SQL만 복사해 작업 대기열에 넣습니다. Mongoose의 HTTP 처리기는 쓰지 않습니다. 그 처리기는 잘못된 본문 길이 헤더에 응답 없이 연결을 닫기 때문입니다. 작업 스레드는 대기열에서 요청을 꺼내 엔진을 API 모드(다음 문장 위치 없이)로 부르고, 만든 JSON을 완료 대기열에 넣은 뒤 `mg_wakeup()`으로 이벤트 루프를 깨우기만 합니다. 응답은 이벤트 루프만 보냅니다. 이벤트 루프는 poll마다 완료 대기열을 비우고, 그 사이 연결이 끊긴 요청의 결과는 해제합니다. 응답은 비차단으로 보내므로 느린 클라이언트가 작업 스레드와 테이블 잠금을 붙잡지 않습니다. 이벤트 루프는 poll(100ms)마다 연결의 마지막 송수신 시각을 보고, `--idle-timeout` 동안 바이트가 오가지 않은 연결을 닫습니다.
+
+대기열에 들어간 INSERT는 연결이 끊겨도 끝까지 실행해 테이블 파일에 남습니다. 그래서 응답을 받지 못한 클라이언트가 같은 INSERT를 다시 보내면 record가 중복될 수 있습니다. 서버는 이 둘을 구분하지 않습니다.
+
+#### keep-alive
+
+HTTP/1.1 연결은 다시 씁니다. 한 연결에 요청을 여러 개 이어 보내면, 서버는 앞 요청의 응답을 송신 버퍼에 넣은 뒤 다음 요청을 꺼내므로 응답은 보낸 순서로 옵니다. 응답을 기다리는 동안에는 그 연결에서 더 읽지 않습니다. 여러 연결의 요청은 작업 스레드들이 병렬로 처리합니다.
+
+`Connection: close` 요청과 `Connection: keep-alive`가 없는 HTTP/1.0 요청에는 응답에 `Connection: close`를 넣고, 보낸 뒤 연결을 닫습니다. 같은 연결에 이어 보낸 SQL은 실행하지 않습니다. 닫을지는 요청을 받을 때 정해 두었다가 응답할 때 씁니다. 본문 길이를 믿을 수 없어 다음 요청이 어디서 시작하는지 모르는 거절(`411`, `413`, `431`, `invalid_body_length`, `invalid_request`)도 연결을 닫습니다.
 
 ### 요청
 
 `POST /query`이고 본문은 SQL 문장 하나입니다. 문장 뒤에 다른 문장이 있으면 어느 문장도 실행하지 않고 `400 multiple_statements`로 거절합니다. 문장 뒤의 공백은 괜찮습니다.
+
+본문 길이는 `Content-Length` 하나로 보냅니다. chunked(`Transfer-Encoding`)는 받지 않습니다. 헤더(요청 줄 포함)는 8 KiB, 본문은 1 MiB까지 받습니다. 둘의 합은 Mongoose의 연결당 수신 버퍼 한도(`MG_MAX_RECV_SIZE`, 3 MiB)보다 작습니다. 그 한도에 먼저 걸리면 Mongoose가 응답 없이 연결을 닫기 때문입니다. 서버는 헤더를 다 받은 때 길이 표기와 상한을 먼저 확인하므로 1 MiB를 넘는 본문은 받기 전에 거절합니다. 선언한 길이만큼 본문을 받기 전에 끊긴 요청은 실행하지 않습니다.
+
+결과 상한은 record 1만 건, 값의 누적 16 MiB(`INT`는 8바이트, `TEXT`는 바이트 길이), JSON 응답 32 MiB입니다. 엔진은 상한을 넘으면 모으기를 멈추고 모은 record를 해제하며, 서버는 JSON을 만들면서 응답 바이트를 확인합니다. 넘으면 `400 result_too_large`입니다. CLI에는 결과 상한이 없습니다.
 
 ### 응답
 
@@ -184,9 +197,16 @@ curl --data-binary 'SELECT * FROM users WHERE id = 1;' http://127.0.0.1:8080/que
 |---|---|---|
 | `400` | `syntax_error`, `table_not_found`, `field_not_found`, `type_mismatch`, `value_count_mismatch`, `int_out_of_range`, `text_too_long` | SQL 오류 |
 | `400` | `multiple_statements` | 본문에 문장이 둘 이상 |
-| `400` | `empty_body` | 본문에 공백만 있음 |
+| `400` | `no_statement` | 빈 본문, 또는 공백만 있는 본문 |
+| `400` | `invalid_sql_body` | 본문에 NUL 바이트(`0x00`)가 있음 |
+| `400` | `result_too_large` | 결과가 record 1만 건, 값 16 MiB, 또는 JSON 32 MiB를 넘음 |
+| `400` | `invalid_body_length` | `Content-Length`가 숫자가 아니거나 여러 번 옴, 또는 `Transfer-Encoding`과 함께 옴. 연결을 닫습니다 |
+| `400` | `invalid_request` | 요청 줄이나 헤더를 HTTP로 읽을 수 없음. 연결을 닫습니다 |
 | `404` | `route_not_found` | `/query`가 아닌 경로 |
 | `405` | `method_not_allowed` | `/query`에 POST가 아닌 메서드. `Allow: POST` 헤더를 같이 보냅니다 |
+| `411` | `length_required` | `Content-Length` 없이 chunked로 보낸 요청(연결을 닫습니다), 또는 `Content-Length`가 없는 `POST /query` |
+| `413` | `body_too_large` | 헤더를 정상으로 읽었고 선언한 본문 길이가 1 MiB를 넘음. 연결을 닫습니다 |
+| `431` | `header_too_large` | 헤더가 8 KiB를 넘음. 연결을 닫습니다 |
 | `500` | `storage_error`, `table_unavailable`, `out_of_memory` | 테이블 파일 쓰기나 읽기 실패, 되돌리기도 실패해 멈춘 테이블, 메모리 부족 |
 | `503` | `queue_full` | 작업 대기열이 가득 참. 기다리지 않고 바로 답합니다 |
 
