@@ -24,6 +24,15 @@ enum engine_status {
     ENGINE_ERROR,
 };
 
+/* 기계가 읽는 오류 이유입니다. API 서버가 상태 코드를 고를 때 씁니다.
+   아직 이유를 나누지 않은 오류는 ENGINE_REASON_NONE입니다. */
+enum engine_error_reason {
+    ENGINE_REASON_NONE,
+    ENGINE_REASON_OUT_OF_MEMORY,
+    ENGINE_REASON_STORAGE_ERROR,
+    ENGINE_REASON_TABLE_UNAVAILABLE,
+};
+
 enum engine_statement_kind {
     ENGINE_STATEMENT_NONE,
     ENGINE_STATEMENT_INSERT,
@@ -35,6 +44,7 @@ enum engine_statement_kind {
 struct engine_result {
     enum engine_status status;
     enum engine_statement_kind kind;
+    enum engine_error_reason error_reason;
     char error_message[ENGINE_ERROR_MAX];
     int64_t inserted_id;
     size_t field_count;

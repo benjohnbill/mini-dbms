@@ -28,6 +28,11 @@ struct table_scan {
     struct value *values;
 };
 
+struct table_file_functions table_file_functions = {
+    .write_at = pwrite,
+    .truncate = ftruncate,
+};
+
 static void error_set(char *error, size_t error_size, const char *format, ...);
 static int schema_load(struct table *table, const char *path, char *error,
                        size_t error_size);
@@ -82,6 +87,7 @@ struct table *table_create(const char *data_dir, const char *name, char *error,
         return NULL;
     }
     table->committed_size = (uint64_t)file_stat.st_size;
+    table->available = true;
     if (table_records_load(table, error, error_size) != 0) {
         table_destroy(table);
         return NULL;
@@ -106,38 +112,54 @@ void table_destroy(struct table *table)
     free(table);
 }
 
-int table_insert(struct table *table, const struct value *values,
-                 int64_t *inserted_id, char *error, size_t error_size)
+enum table_insert_status table_insert(struct table *table,
+                                      const struct value *values,
+                                      int64_t *inserted_id, char *error,
+                                      size_t error_size)
 {
     size_t size = record_size(table, values);
     unsigned char *bytes;
     int64_t new_id;
+    int write_errno;
 
     if (table->last_id == INT64_MAX) {
         error_set(error, error_size, "%s: id reached the INT maximum",
                   table->name);
-        return -1;
+        return TABLE_INSERT_ID_EXHAUSTED;
     }
     new_id = table->last_id + 1;
+    /* 1단계: 파일을 건드리기 전에 메모리 할당을 모두 끝냅니다. */
     bytes = malloc(size);
     if (bytes == NULL) {
         error_set(error, error_size, "out of memory");
-        return -1;
+        return TABLE_INSERT_OUT_OF_MEMORY;
     }
     record_encode(table, new_id, values, bytes);
+    /* 2단계: committed_size 위치에 씁니다. 실패하면 반쯤 쓰인 record를
+       잘라 내 파일을 쓰기 전 길이로 되돌립니다. */
     if (write_full(table->fd, bytes, size, table->committed_size) != 0) {
-        error_set(error, error_size, "%s.tbl: %s", table->name,
-                  strerror(errno));
+        write_errno = errno;
         free(bytes);
-        return -1;
+        if (table_file_functions.truncate(table->fd,
+                                          (off_t)table->committed_size) != 0) {
+            table->available = false;
+            error_set(error, error_size,
+                      "%s.tbl: write failed (%s) and rollback failed (%s); "
+                      "unknown whether this INSERT was saved",
+                      table->name, strerror(write_errno), strerror(errno));
+            return TABLE_INSERT_UNAVAILABLE;
+        }
+        error_set(error, error_size, "%s.tbl: %s", table->name,
+                  strerror(write_errno));
+        return TABLE_INSERT_STORAGE_ERROR;
     }
     free(bytes);
-    /* 쓰기가 모두 끝난 뒤에만 파일 끝 위치와 ID를 올립니다. */
+    /* 3단계: 쓰기가 모두 끝난 뒤에만 파일 끝 위치와 ID를 올립니다. */
     table->committed_size += size;
     table->last_id = new_id;
     *inserted_id = new_id;
 
-    return 0;
+    return TABLE_INSERT_OK;
 }
 
 struct record_iterator *table_scan_create(struct table *table)
@@ -359,10 +381,14 @@ static int write_full(int fd, const unsigned char *bytes, size_t size,
                       uint64_t offset)
 {
     while (size > 0) {
-        ssize_t written = pwrite(fd, bytes, size, (off_t)offset);
+        ssize_t written =
+            table_file_functions.write_at(fd, bytes, size, (off_t)offset);
 
         if (written < 0 && errno == EINTR) {
             continue;
+        }
+        if (written == 0) {
+            errno = EIO; /* 0바이트 쓰기는 errno를 남기지 않습니다 */
         }
         if (written <= 0) {
             return -1;

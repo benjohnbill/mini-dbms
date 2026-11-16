@@ -35,6 +35,8 @@ static struct table *engine_find_table(const struct engine *engine,
 static void execute_insert(struct table *table,
                            const struct statement *statement,
                            struct engine_result *result);
+static enum engine_error_reason
+insert_error_reason(enum table_insert_status insert_status);
 static void execute_select(struct table *table, struct engine_result *result);
 static int result_set_fields(struct engine_result *result,
                              const struct table *table);
@@ -240,6 +242,8 @@ static void execute_insert(struct table *table,
                            const struct statement *statement,
                            struct engine_result *result)
 {
+    enum table_insert_status insert_status;
+
     result->kind = ENGINE_STATEMENT_INSERT;
     if (statement->value_count != table->field_count) {
         result_fail(result, "%s has %zu fields but got %zu values", table->name,
@@ -253,13 +257,30 @@ static void execute_insert(struct table *table,
             return;
         }
     }
-    if (table_insert(table, statement->values, &result->inserted_id,
-                     result->error_message,
-                     sizeof(result->error_message)) != 0) {
+    insert_status =
+        table_insert(table, statement->values, &result->inserted_id,
+                     result->error_message, sizeof(result->error_message));
+    if (insert_status != TABLE_INSERT_OK) {
         result->status = ENGINE_ERROR;
+        result->error_reason = insert_error_reason(insert_status);
         return;
     }
     result->status = ENGINE_OK;
+}
+
+static enum engine_error_reason
+insert_error_reason(enum table_insert_status insert_status)
+{
+    switch (insert_status) {
+    case TABLE_INSERT_OUT_OF_MEMORY:
+        return ENGINE_REASON_OUT_OF_MEMORY;
+    case TABLE_INSERT_STORAGE_ERROR:
+        return ENGINE_REASON_STORAGE_ERROR;
+    case TABLE_INSERT_UNAVAILABLE:
+        return ENGINE_REASON_TABLE_UNAVAILABLE;
+    default:
+        return ENGINE_REASON_NONE;
+    }
 }
 
 static void execute_select(struct table *table, struct engine_result *result)

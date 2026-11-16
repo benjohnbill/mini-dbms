@@ -1,4 +1,6 @@
 #include <dirent.h>
+#include <errno.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,6 +8,7 @@
 
 #include "acutest.h"
 #include "engine.h"
+#include "table.h"
 
 #define PATH_MAX_LEN 512
 
@@ -30,6 +33,10 @@ static long file_size_get(const char *name)
 
     return size;
 }
+
+static unsigned char *file_bytes_create(const char *name, size_t *size);
+static ssize_t part_then_fail_pwrite(int fd, const void *bytes, size_t size,
+                                     off_t offset);
 
 static void data_dir_create(void);
 static void data_dir_remove(void);
@@ -345,6 +352,45 @@ static void insert_after_max_id_fails_and_keeps_file_test(void)
     data_dir_remove();
 }
 
+static void failed_write_with_rollback_keeps_file_and_id_test(void)
+{
+    struct engine *engine = users_engine_create();
+    struct engine_result *result =
+        execute_one(engine, "INSERT INTO users VALUES ('kim', 'k@x', 20);");
+    size_t before_size;
+    size_t after_size;
+    unsigned char *before;
+    unsigned char *after;
+
+    engine_result_destroy(result);
+    before = file_bytes_create("users.tbl", &before_size);
+
+    table_file_functions.write_at = part_then_fail_pwrite;
+    result =
+        execute_one(engine, "INSERT INTO users VALUES ('lee', 'l@x', 31);");
+    table_file_functions.write_at = pwrite;
+    TEST_CHECK(result->status == ENGINE_ERROR);
+    TEST_CHECK(result->error_reason == ENGINE_REASON_STORAGE_ERROR);
+    TEST_MSG("error: %s", result->error_message);
+    engine_result_destroy(result);
+
+    after = file_bytes_create("users.tbl", &after_size);
+    TEST_CHECK(after_size == before_size);
+    TEST_CHECK(after_size == before_size &&
+               memcmp(before, after, before_size) == 0);
+    free(before);
+    free(after);
+
+    result =
+        execute_one(engine, "INSERT INTO users VALUES ('park', 'p@x', 4);");
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_CHECK(result->inserted_id == 2);
+    engine_result_destroy(result);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
 TEST_LIST = {
     {"[T6] INSERT는 ID 1을 받고 SELECT *가 그 record를 돌려준다",
      insert_returns_id_and_select_returns_record_test},
@@ -373,6 +419,9 @@ TEST_LIST = {
     {"다음 ID가 INT 최댓값을 넘으면 INSERT는 오류이고 테이블 파일이 "
      "바뀌지 않는다",
      insert_after_max_id_fails_and_keeps_file_test},
+    {"[T80] 쓰기가 실패하고 되돌리기가 성공하면 테이블 파일이 그대로이고 "
+     "다음 INSERT가 실패한 INSERT의 ID를 받는다",
+     failed_write_with_rollback_keeps_file_and_id_test},
     {NULL, NULL},
 };
 
@@ -448,4 +497,37 @@ static void check_text(const struct value *value, const char *expected)
     TEST_CHECK(memcmp(value->text, expected, value->text_len) == 0);
     TEST_MSG("expected: %s, got: %.*s", expected, (int)value->text_len,
              value->text);
+}
+
+/* 데이터 폴더의 파일 전체를 읽어 새 버퍼로 돌려줍니다. */
+static unsigned char *file_bytes_create(const char *name, size_t *size)
+{
+    long file_size = file_size_get(name);
+    char path[PATH_MAX_LEN];
+    unsigned char *bytes = malloc((size_t)file_size + 1);
+    FILE *file;
+
+    TEST_ASSERT(bytes != NULL);
+    snprintf(path, sizeof(path), "%s/%s", data_dir, name);
+    file = fopen(path, "rb");
+    TEST_ASSERT(file != NULL);
+    *size = fread(bytes, 1, (size_t)file_size, file);
+    fclose(file);
+
+    return bytes;
+}
+
+/* 첫 호출은 요청의 절반만 실제로 쓰고, 그다음 호출은 디스크가 가득 찬 것처럼
+   실패합니다. 반쯤 쓰인 record가 파일에 남은 상태를 만듭니다. */
+static ssize_t part_then_fail_pwrite(int fd, const void *bytes, size_t size,
+                                     off_t offset)
+{
+    static bool wrote_part;
+
+    if (!wrote_part) {
+        wrote_part = true;
+        return pwrite(fd, bytes, size / 2, offset);
+    }
+    errno = ENOSPC;
+    return -1;
 }
