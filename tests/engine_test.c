@@ -243,6 +243,137 @@ static void where_returns_matching_records_or_none_test(void)
     data_dir_remove();
 }
 
+static void syntax_error_reports_line_and_expected_token_test(void)
+{
+    struct engine *engine = users_engine_create();
+    const struct {
+        const char *sql;
+        size_t line;
+    } cases[] = {
+        {"SELECT *\nFROM users", 2},
+        {"INSERT INTO users VALUES ('kim',\n'oops, 1);", 2},
+        {"\n-- 주석\nSELECT * FROM users;", 2},
+    };
+    struct engine_result *result;
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        result = execute_one(engine, cases[i].sql);
+        TEST_CHECK(result->status == ENGINE_ERROR);
+        TEST_CHECK(result->error_code == ENGINE_ERROR_SYNTAX);
+        TEST_CHECK(result->error_line == cases[i].line);
+        TEST_MSG("sql: %s, line: %zu, message: %s", cases[i].sql,
+                 result->error_line, result->error_message);
+        engine_result_destroy(result);
+    }
+    result = execute_one(engine, "INSERT INTO users\nVALUES 'a', 'b', 1);");
+    TEST_CHECK(result->error_line == 2);
+    TEST_CHECK(
+        strcmp(result->error_message, "VALUES 다음에 '('가 와야 합니다") == 0);
+    TEST_MSG("message: %s", result->error_message);
+    engine_result_destroy(result);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
+static void each_kind_of_bad_statement_has_its_own_error_code_test(void)
+{
+    struct engine *engine = users_engine_create();
+    const struct {
+        const char *sql;
+        enum engine_error_code code;
+    } cases[] = {
+        {"SELECT * FROM nobody;", ENGINE_ERROR_NO_TABLE},
+        {"SELECT nope FROM users;", ENGINE_ERROR_NO_FIELD},
+        {"SELECT * FROM users WHERE nope = 1;", ENGINE_ERROR_NO_FIELD},
+        {"INSERT INTO users VALUES ('kim', 20);", ENGINE_ERROR_VALUE_COUNT},
+        {"INSERT INTO users VALUES (1, 'kim', 'k@x', 20);",
+         ENGINE_ERROR_VALUE_COUNT},
+        {"INSERT INTO users VALUES ('kim', 'k@x', 'twenty');",
+         ENGINE_ERROR_TYPE},
+        {"SELECT * FROM users WHERE id = 'abc';", ENGINE_ERROR_TYPE},
+        {"SELECT * FROM users WHERE age = 'x';", ENGINE_ERROR_TYPE},
+        {"INSERT INTO users VALUES ('kim', 'k@x', 9223372036854775808);",
+         ENGINE_ERROR_INT_RANGE},
+        {"SELECT * FROM users WHERE age = -9223372036854775809;",
+         ENGINE_ERROR_INT_RANGE},
+    };
+    struct engine_result *result;
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        result = execute_one(engine, cases[i].sql);
+        TEST_CHECK(result->status == ENGINE_ERROR);
+        TEST_CHECK(result->error_code == cases[i].code);
+        TEST_MSG("sql: %s, code: %d, message: %s", cases[i].sql,
+                 (int)result->error_code, result->error_message);
+        engine_result_destroy(result);
+    }
+    result = execute_one(
+        engine,
+        "INSERT INTO users VALUES ('kim', 'k@x', -9223372036854775808);");
+    TEST_CHECK(result->status == ENGINE_OK);
+    engine_result_destroy(result);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
+/* 1 MiB는 받고 1 MiB + 1바이트는 거절합니다. */
+static void text_longer_than_1_mib_is_an_error_test(void)
+{
+    struct engine *engine = users_engine_create();
+    size_t text_len = (size_t)1 << 20;
+    const char *prefix = "INSERT INTO users VALUES ('";
+    const char *suffix = "', 'k@x', 1);";
+    size_t prefix_len = strlen(prefix);
+    char *sql = malloc(prefix_len + text_len + 1 + strlen(suffix) + 1);
+    struct engine_result *result;
+
+    TEST_ASSERT(sql != NULL);
+    memcpy(sql, prefix, prefix_len);
+    memset(sql + prefix_len, 'a', text_len);
+    strcpy(sql + prefix_len + text_len, suffix);
+    result = execute_one(engine, sql);
+    TEST_CHECK(result->status == ENGINE_OK);
+    engine_result_destroy(result);
+
+    sql[prefix_len + text_len] = 'a';
+    strcpy(sql + prefix_len + text_len + 1, suffix);
+    result = execute_one(engine, sql);
+    TEST_CHECK(result->status == ENGINE_ERROR);
+    TEST_CHECK(result->error_code == ENGINE_ERROR_TEXT_TOO_LONG);
+    engine_result_destroy(result);
+    free(sql);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
+static void select_reports_scan_and_records_examined_test(void)
+{
+    struct engine *engine = users_engine_create();
+    struct engine_result *result;
+
+    engine_result_destroy(
+        execute_one(engine, "INSERT INTO users VALUES ('kim', 'k@x', 20);"));
+    engine_result_destroy(
+        execute_one(engine, "INSERT INTO users VALUES ('lee', 'l@x', 31);"));
+    result = execute_one(engine, "SELECT * FROM users WHERE id = 2;");
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_CHECK(result->access_path == ENGINE_ACCESS_PATH_SCAN);
+    TEST_CHECK(result->record_count == 1);
+    TEST_CHECK(result->records_examined == 2);
+    engine_result_destroy(result);
+
+    result = execute_one(engine, "SELECT * FROM users WHERE age = 'x';");
+    TEST_CHECK(result->status == ENGINE_ERROR);
+    TEST_CHECK(result->records_examined == 0);
+    engine_result_destroy(result);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
 TEST_LIST = {
     {"[T6] INSERT는 ID 1을 받고 SELECT *가 그 record를 돌려준다",
      insert_returns_id_and_select_returns_record_test},
@@ -261,6 +392,16 @@ TEST_LIST = {
      field_list_returns_only_named_fields_in_order_test},
     {"[T9] WHERE는 값이 같은 record만 돌려주고 없으면 0건이다",
      where_returns_matching_records_or_none_test},
+    {"[T10] 문법 오류는 줄 번호와 기대한 토큰을 알린다",
+     syntax_error_reports_line_and_expected_token_test},
+    {"[T11] 없는 테이블, 없는 field, 값 개수, 타입, INT 범위가 각각 다른 "
+     "오류이다",
+     each_kind_of_bad_statement_has_its_own_error_code_test},
+    {"[T12] 1 MiB를 넘는 TEXT 값은 오류이고 1 MiB는 받는다",
+     text_longer_than_1_mib_is_an_error_test},
+    {"SELECT는 접근 경로 SCAN과 읽은 레코드 수를 돌려주고 타입 오류는 레코드를 "
+     "읽지 않는다",
+     select_reports_scan_and_records_examined_test},
     {NULL, NULL},
 };
 

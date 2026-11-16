@@ -44,18 +44,30 @@ enum engine_error_code {
     ENGINE_ERROR_NO_MEMORY,
 };
 
+/* SELECT가 record를 찾은 방법입니다. 지금은 SCAN뿐이고 티켓 07이 INDEX를
+   더합니다. */
+enum engine_access_path {
+    ENGINE_ACCESS_PATH_SCAN,
+};
+
 /* 실행 결과 하나입니다. 받은 쪽이 engine_result_destroy()로 해제합니다.
    record i의 field j는 values[i * field_count + j]에 있습니다. */
 struct engine_result {
     enum engine_status status;
     enum engine_statement_kind kind;
     enum engine_error_code error_code;
+    /* 오류 위치입니다. engine_execute가 받은 sql의 첫 줄을 1로 셉니다.
+       파일 안의 줄 번호는 부르는 쪽이 앞의 줄 수를 더해 구합니다. */
+    size_t error_line;
+    size_t error_byte_in_line;
     char error_message[ENGINE_ERROR_MAX];
     int64_t inserted_id;
     size_t field_count;
     char **field_names;
     size_t record_count;
     struct value *values;
+    enum engine_access_path access_path;
+    uint64_t records_examined; /* 조건을 보려고 읽은 record 수 */
 };
 
 /* data_dir의 스키마 파일과 테이블 파일을 엽니다. 실패하면 NULL을 돌려주고

@@ -22,32 +22,45 @@ enum token_kind {
 };
 
 /* TOKEN_STRING의 text는 ''를 '로 바꾼 새 메모리이고, 받은 쪽이 해제합니다.
-   TOKEN_WORD의 text는 SQL 문자열 안을 가리킵니다. */
+   TOKEN_WORD의 이름은 start와 length로 SQL 문자열 안을 가리킵니다.
+   line과 byte_in_line은 토큰 첫 글자의 위치입니다. */
 struct token {
     enum token_kind kind;
     const char *start;
     size_t length;
+    size_t line;
+    size_t byte_in_line;
     int64_t integer;
     char *text;
     char symbol;
 };
 
+/* previous는 오류 메시지의 "X 다음에"에 쓰는 바로 앞 토큰입니다. text는
+   비어 있습니다. */
 struct parser {
     const char *cursor;
+    size_t line;
+    const char *line_start;
     struct token current;
-    char *error;
-    size_t error_size;
+    struct token previous;
+    struct sql_error *error;
     bool failed;
 };
 
-static void parser_fail(struct parser *parser, const char *format, ...);
+static void parser_fail(struct parser *parser, enum sql_error_code code,
+                        const char *format, ...);
+static void parser_fail_expected(struct parser *parser, const char *expected);
 static void parser_advance(struct parser *parser);
+static void parser_skip_space(struct parser *parser);
 static void token_read_integer(struct parser *parser);
 static void token_read_string(struct parser *parser);
+static bool parser_at_symbol(const struct parser *parser, char symbol);
 static bool parser_accept_keyword(struct parser *parser, const char *keyword);
-static void parser_expect_keyword(struct parser *parser, const char *keyword);
-static void parser_expect_symbol(struct parser *parser, char symbol);
-static char *parser_expect_name(struct parser *parser);
+static void parser_expect_keyword(struct parser *parser, const char *keyword,
+                                  const char *expected);
+static void parser_expect_symbol(struct parser *parser, char symbol,
+                                 const char *expected);
+static char *parser_expect_name(struct parser *parser, const char *expected);
 static void parser_parse_insert(struct parser *parser,
                                 struct statement *statement);
 static void parser_parse_values(struct parser *parser,
@@ -62,10 +75,10 @@ static void parser_parse_fields(struct parser *parser,
 static bool statement_add_field(struct statement *statement, char *field);
 
 enum sql_status sql_parse(const char *sql, struct statement **statement_out,
-                          const char **next_sql, char *error, size_t error_size)
+                          const char **next_sql, struct sql_error *error)
 {
     struct parser parser = {
-        .cursor = sql, .error = error, .error_size = error_size};
+        .cursor = sql, .line = 1, .line_start = sql, .error = error};
     struct statement *statement;
 
     parser_advance(&parser);
@@ -75,20 +88,24 @@ enum sql_status sql_parse(const char *sql, struct statement **statement_out,
     }
     statement = calloc(1, sizeof(*statement));
     if (statement == NULL) {
-        parser_fail(&parser, "out of memory");
+        parser_fail(&parser, SQL_ERROR_NO_MEMORY, "메모리가 부족합니다");
+        free(parser.current.text);
         return SQL_ERROR;
     }
+    statement->line = parser.current.line;
+    statement->byte_in_line = parser.current.byte_in_line;
     if (parser_accept_keyword(&parser, "INSERT")) {
         parser_parse_insert(&parser, statement);
     } else if (parser_accept_keyword(&parser, "SELECT")) {
         parser_parse_select(&parser, statement);
     } else {
-        parser_fail(&parser, "expected INSERT or SELECT");
+        parser_fail(&parser, SQL_ERROR_SYNTAX,
+                    "문장은 INSERT나 SELECT로 시작해야 합니다");
     }
     /* ; 다음 토큰은 읽지 않습니다. 다음 문장의 오류가 이 문장의 오류가
        되지 않게 하기 위해서입니다. */
-    if (parser.current.kind != TOKEN_SYMBOL || parser.current.symbol != ';') {
-        parser_fail(&parser, "expected ';'");
+    if (!parser_at_symbol(&parser, ';')) {
+        parser_fail_expected(&parser, "';'가");
     }
     free(parser.current.text);
     if (parser.failed) {
@@ -124,8 +141,10 @@ void sql_statement_destroy(struct statement *statement)
     free(statement);
 }
 
-/* 첫 오류만 남깁니다. 오류 뒤의 토큰은 모두 끝으로 봅니다. */
-static void parser_fail(struct parser *parser, const char *format, ...)
+/* 첫 오류만 남깁니다. 위치는 지금 토큰입니다. 오류 뒤의 토큰은 모두 끝으로
+   봅니다. */
+static void parser_fail(struct parser *parser, enum sql_error_code code,
+                        const char *format, ...)
 {
     va_list args;
 
@@ -133,22 +152,43 @@ static void parser_fail(struct parser *parser, const char *format, ...)
         return;
     }
     parser->failed = true;
+    parser->error->code = code;
+    parser->error->line = parser->current.line;
+    parser->error->byte_in_line = parser->current.byte_in_line;
     va_start(args, format);
-    vsnprintf(parser->error, parser->error_size, format, args);
+    vsnprintf(parser->error->message, sizeof(parser->error->message), format,
+              args);
     va_end(args);
+}
+
+/* "VALUES 다음에 '('가 와야 합니다" 모양입니다. expected는 조사까지 붙인
+   기대한 토큰입니다. 문자열 토큰은 길 수 있어 내용 대신 "문자열"로 적습니다. */
+static void parser_fail_expected(struct parser *parser, const char *expected)
+{
+    const struct token *previous = &parser->previous;
+
+    if (previous->kind == TOKEN_STRING) {
+        parser_fail(parser, SQL_ERROR_SYNTAX, "문자열 다음에 %s 와야 합니다",
+                    expected);
+    } else {
+        parser_fail(parser, SQL_ERROR_SYNTAX, "%.*s 다음에 %s 와야 합니다",
+                    (int)previous->length, previous->start, expected);
+    }
 }
 
 static void parser_advance(struct parser *parser)
 {
-    const char *cursor = parser->cursor;
+    const char *cursor;
 
     free(parser->current.text);
+    parser->current.text = NULL;
+    parser->previous = parser->current;
     memset(&parser->current, 0, sizeof(parser->current));
-    while (isspace((unsigned char)*cursor)) {
-        cursor++;
-    }
+    parser_skip_space(parser);
+    cursor = parser->cursor;
     parser->current.start = cursor;
-    parser->cursor = cursor;
+    parser->current.line = parser->line;
+    parser->current.byte_in_line = (size_t)(cursor - parser->line_start) + 1;
     if (parser->failed || *cursor == '\0') {
         parser->current.kind = TOKEN_END;
     } else if (isalpha((unsigned char)*cursor) || *cursor == '_') {
@@ -158,15 +198,31 @@ static void parser_advance(struct parser *parser)
         parser->current.kind = TOKEN_WORD;
         parser->current.length = (size_t)(cursor - parser->current.start);
         parser->cursor = cursor;
-    } else if (isdigit((unsigned char)*cursor) || *cursor == '-') {
+    } else if (isdigit((unsigned char)*cursor) ||
+               (*cursor == '-' && isdigit((unsigned char)cursor[1]))) {
         token_read_integer(parser);
     } else if (*cursor == '\'') {
         token_read_string(parser);
+    } else if (cursor[0] == '-' && cursor[1] == '-') {
+        parser_fail(parser, SQL_ERROR_SYNTAX, "주석(--)은 지원하지 않습니다");
+        parser->current.kind = TOKEN_END;
     } else {
         parser->current.kind = TOKEN_SYMBOL;
         parser->current.symbol = *cursor;
         parser->current.length = 1;
         parser->cursor = cursor + 1;
+    }
+}
+
+/* 공백을 건너뛰며 줄 번호를 셉니다. */
+static void parser_skip_space(struct parser *parser)
+{
+    while (isspace((unsigned char)*parser->cursor)) {
+        if (*parser->cursor == '\n') {
+            parser->line++;
+            parser->line_start = parser->cursor + 1;
+        }
+        parser->cursor++;
     }
 }
 
@@ -177,8 +233,9 @@ static void token_read_integer(struct parser *parser)
 
     errno = 0;
     integer = strtoll(parser->cursor, &end, 10);
-    if (end == parser->cursor || errno == ERANGE) {
-        parser_fail(parser, "invalid integer");
+    if (errno == ERANGE) {
+        parser_fail(parser, SQL_ERROR_INT_RANGE,
+                    "INT 범위(64비트 부호 있는 정수)를 넘는 숫자입니다");
         parser->current.kind = TOKEN_END;
         return;
     }
@@ -188,7 +245,8 @@ static void token_read_integer(struct parser *parser)
     parser->cursor = end;
 }
 
-/* '...' 안의 ''는 작은따옴표 하나입니다. */
+/* '...' 안의 ''는 작은따옴표 하나입니다. 문자열 안의 줄바꿈도 줄 번호에
+   셉니다. */
 static void token_read_string(struct parser *parser)
 {
     const char *cursor = parser->cursor + 1;
@@ -196,14 +254,14 @@ static void token_read_string(struct parser *parser)
     char *text = malloc(strlen(cursor) + 1);
 
     if (text == NULL) {
-        parser_fail(parser, "out of memory");
+        parser_fail(parser, SQL_ERROR_NO_MEMORY, "메모리가 부족합니다");
         parser->current.kind = TOKEN_END;
         return;
     }
     for (;;) {
         if (*cursor == '\0') {
             free(text);
-            parser_fail(parser, "unterminated string");
+            parser_fail(parser, SQL_ERROR_SYNTAX, "닫히지 않은 문자열입니다");
             parser->current.kind = TOKEN_END;
             return;
         }
@@ -215,9 +273,14 @@ static void token_read_string(struct parser *parser)
         }
         if (text_len == TEXT_MAX_BYTES) {
             free(text);
-            parser_fail(parser, "string is longer than 1 MiB");
+            parser_fail(parser, SQL_ERROR_TEXT_TOO_LONG,
+                        "TEXT 값이 1 MiB를 넘습니다");
             parser->current.kind = TOKEN_END;
             return;
+        }
+        if (*cursor == '\n') {
+            parser->line++;
+            parser->line_start = cursor + 1;
         }
         text[text_len++] = *cursor++;
     }
@@ -226,6 +289,12 @@ static void token_read_string(struct parser *parser)
     parser->current.text = text;
     parser->current.length = text_len;
     parser->cursor = cursor + 1;
+}
+
+static bool parser_at_symbol(const struct parser *parser, char symbol)
+{
+    return parser->current.kind == TOKEN_SYMBOL &&
+           parser->current.symbol == symbol;
 }
 
 static bool parser_accept_keyword(struct parser *parser, const char *keyword)
@@ -240,34 +309,35 @@ static bool parser_accept_keyword(struct parser *parser, const char *keyword)
     return true;
 }
 
-static void parser_expect_keyword(struct parser *parser, const char *keyword)
+static void parser_expect_keyword(struct parser *parser, const char *keyword,
+                                  const char *expected)
 {
     if (!parser_accept_keyword(parser, keyword)) {
-        parser_fail(parser, "expected %s", keyword);
+        parser_fail_expected(parser, expected);
     }
 }
 
-static void parser_expect_symbol(struct parser *parser, char symbol)
+static void parser_expect_symbol(struct parser *parser, char symbol,
+                                 const char *expected)
 {
-    if (parser->current.kind != TOKEN_SYMBOL ||
-        parser->current.symbol != symbol) {
-        parser_fail(parser, "expected '%c'", symbol);
+    if (!parser_at_symbol(parser, symbol)) {
+        parser_fail_expected(parser, expected);
         return;
     }
     parser_advance(parser);
 }
 
-static char *parser_expect_name(struct parser *parser)
+static char *parser_expect_name(struct parser *parser, const char *expected)
 {
     char *name;
 
     if (parser->current.kind != TOKEN_WORD) {
-        parser_fail(parser, "expected a table name");
+        parser_fail_expected(parser, expected);
         return NULL;
     }
     name = strndup(parser->current.start, parser->current.length);
     if (name == NULL) {
-        parser_fail(parser, "out of memory");
+        parser_fail(parser, SQL_ERROR_NO_MEMORY, "메모리가 부족합니다");
     }
     parser_advance(parser);
 
@@ -279,12 +349,12 @@ static void parser_parse_insert(struct parser *parser,
                                 struct statement *statement)
 {
     statement->kind = STATEMENT_INSERT;
-    parser_expect_keyword(parser, "INTO");
-    statement->table = parser_expect_name(parser);
-    parser_expect_keyword(parser, "VALUES");
-    parser_expect_symbol(parser, '(');
+    parser_expect_keyword(parser, "INTO", "INTO가");
+    statement->table = parser_expect_name(parser, "테이블 이름이");
+    parser_expect_keyword(parser, "VALUES", "VALUES가");
+    parser_expect_symbol(parser, '(', "'('가");
     parser_parse_values(parser, statement);
-    parser_expect_symbol(parser, ')');
+    parser_expect_symbol(parser, ')', "')'가");
 }
 
 static void parser_parse_values(struct parser *parser,
@@ -300,11 +370,10 @@ static void parser_parse_values(struct parser *parser,
             if (value.type == VALUE_TEXT) {
                 free((char *)value.text);
             }
-            parser_fail(parser, "out of memory");
+            parser_fail(parser, SQL_ERROR_NO_MEMORY, "메모리가 부족합니다");
             return;
         }
-        if (parser->current.kind != TOKEN_SYMBOL ||
-            parser->current.symbol != ',') {
+        if (!parser_at_symbol(parser, ',')) {
             return;
         }
         parser_advance(parser);
@@ -325,7 +394,7 @@ static bool parser_take_value(struct parser *parser, struct value *value)
         value->text_len = (uint32_t)parser->current.length;
         parser->current.text = NULL;
     } else {
-        parser_fail(parser, "expected an integer or a string");
+        parser_fail_expected(parser, "정수나 문자열이");
         return false;
     }
     parser_advance(parser);
@@ -353,18 +422,18 @@ static void parser_parse_select(struct parser *parser,
                                 struct statement *statement)
 {
     statement->kind = STATEMENT_SELECT;
-    if (parser->current.kind == TOKEN_SYMBOL && parser->current.symbol == '*') {
+    if (parser_at_symbol(parser, '*')) {
         parser_advance(parser);
     } else {
         parser_parse_fields(parser, statement);
     }
-    parser_expect_keyword(parser, "FROM");
-    statement->table = parser_expect_name(parser);
+    parser_expect_keyword(parser, "FROM", "FROM이");
+    statement->table = parser_expect_name(parser, "테이블 이름이");
     if (!parser_accept_keyword(parser, "WHERE")) {
         return;
     }
-    statement->where_field = parser_expect_name(parser);
-    parser_expect_symbol(parser, '=');
+    statement->where_field = parser_expect_name(parser, "field 이름이");
+    parser_expect_symbol(parser, '=', "'='가");
     parser_take_value(parser, &statement->where_value);
 }
 
@@ -372,18 +441,17 @@ static void parser_parse_fields(struct parser *parser,
                                 struct statement *statement)
 {
     for (;;) {
-        char *field = parser_expect_name(parser);
+        char *field = parser_expect_name(parser, "'*'나 field 이름이");
 
         if (field == NULL) {
             return;
         }
         if (!statement_add_field(statement, field)) {
             free(field);
-            parser_fail(parser, "out of memory");
+            parser_fail(parser, SQL_ERROR_NO_MEMORY, "메모리가 부족합니다");
             return;
         }
-        if (parser->current.kind != TOKEN_SYMBOL ||
-            parser->current.symbol != ',') {
+        if (!parser_at_symbol(parser, ',')) {
             return;
         }
         parser_advance(parser);
