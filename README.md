@@ -64,10 +64,10 @@ make verify
 `make`로 CLI(`build/mini-dbms`)를 빌드합니다. CLI는 데이터 폴더와 SQL 파일을 받습니다.
 
 ```text
-mini-dbms [--data 폴더] <SQL 파일>
+mini-dbms [--data 폴더] [-q] <SQL 파일>
 ```
 
-데이터 폴더에는 테이블마다 스키마 파일과 빈 테이블 파일을 미리 만들어 둡니다. 엔진은 두 파일을 만들지 않습니다. 스키마 파일은 한 줄에 field 하나(`이름 INT` 또는 `이름 TEXT`)를 적고, `id`는 적지 않습니다. 테이블 이름은 파일 이름입니다. `--data`를 생략하면 `data/`를 씁니다. 우리 `INT`는 64비트입니다(PostgreSQL과 MySQL의 `INT`는 32비트).
+데이터 폴더에는 테이블마다 스키마 파일과 빈 테이블 파일을 미리 만들어 둡니다. 엔진은 두 파일을 만들지 않습니다. 스키마 파일은 한 줄에 field 하나(`이름 INT` 또는 `이름 TEXT`)를 적고, `id`는 적지 않습니다. 테이블 이름은 파일 이름입니다. `--data`를 생략하면 `data/`를 씁니다. `INT`는 64비트 부호 있는 정수이고(PostgreSQL과 MySQL의 `INT`는 32비트), `TEXT` 값 하나는 최대 1 MiB입니다.
 
 ```bash
 make
@@ -88,7 +88,9 @@ id	name	email	age
 1	kim	kim@example.com	20
 ```
 
-최종 PRD가 정한 CLI에는 INSERT 결과 출력을 끄는 `-q`, stderr의 메타 줄(티켓 02), 바이너리 데이터 파일을 사람이 읽는 줄로 보는 `dump` 명령(티켓 03)이 더해집니다.
+문장마다 stderr에 메타 줄 하나를 씁니다. INSERT는 `-- 1 record inserted, id 3`, SELECT는 `-- 2 records, SCAN, examined 5, 0.02 ms` 모양입니다. `-q`는 INSERT의 메타 줄을 끕니다(100만 건 적재용). 오류는 `2번째 줄: VALUES 다음에 '('가 와야 합니다`처럼 SQL 파일의 줄 번호와 함께 stderr에 씁니다. SQL 파일에 NUL 바이트가 있으면 문장을 하나도 실행하지 않고 종료 코드 1로 끝납니다.
+
+최종 PRD가 정한 CLI에는 바이너리 데이터 파일을 사람이 읽는 줄로 보는 `dump` 명령(티켓 03)이 더해집니다.
 
 필요한 검사만 따로 실행할 수도 있습니다.
 
@@ -136,6 +138,8 @@ Phase 2의 ID 기준 SELECT(인덱스 사용)와 다른 필드 기준 SELECT(선
 티켓마다 그 티켓이 만드는 한계를 한 줄씩 더합니다(티켓 01, 02, 04, 10, 12, 13). 전체 목록은 `docs/prd/final.md` § Further Notes에 있고, 일부러 하지 않는 기능은 같은 문서의 Out of Scope에 있습니다.
 
 - `fsync`를 하지 않아 정전 때 성공을 알린 record를 잃을 수 있습니다(`docs/prd/final.md` § 공통, 영속성).
+- CLI가 오류에서 멈춰도 그 앞에서 성공한 INSERT는 테이블 파일에 남습니다. 트랜잭션이 없기 때문입니다(`docs/prd/final.md` § Phase 1, CLI).
+- 우리 `INT`는 64비트이고 PostgreSQL과 MySQL의 `INT`(32비트)와 다릅니다(`docs/prd/final.md` § Phase 1, 타입).
 
 ## 파일 트리
 
