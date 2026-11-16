@@ -21,6 +21,12 @@ struct work_queue *work_queue_create(size_t thread_count, size_t capacity,
    돌려주고, job은 부른 쪽에 남습니다. */
 bool work_queue_submit(struct work_queue *queue, void *job);
 
+/* 아직 시작하지 않은 작업을 넣은 순서로 대기열에서 모두 빼고, 하나마다
+   discard(job)을 부릅니다. 실행 중인 작업은 건드리지 않습니다. 뺀 작업의
+   수를 돌려줍니다. discard는 대기열의 mutex를 쥔 채로 불리므로 대기열을
+   다시 부르면 안 됩니다. */
+size_t work_queue_discard(struct work_queue *queue, void (*discard)(void *job));
+
 /* 대기열에 남은 작업을 모두 실행한 뒤 작업 스레드를 끝내고 해제합니다. */
 void work_queue_destroy(struct work_queue *queue);
 
