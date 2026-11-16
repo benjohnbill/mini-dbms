@@ -25,11 +25,13 @@ struct table {
     bool available;  /* 되돌리기가 실패하면 거짓. 재시작해야 다시 참 */
 };
 
-/* 테이블 코드가 파일을 쓰고 자를 때 부르는 함수 표입니다. 실제 값은 pwrite와
-   ftruncate이고, 테스트가 바꿔 끼워 쓰기 실패와 되돌리기 실패를 만듭니다. */
+/* INSERT가 파일을 쓰고 자를 때, 그리고 파일을 쓰기 전에 record 버퍼를
+   할당할 때 부르는 함수 표입니다. 실제 값은 pwrite, ftruncate, malloc이고,
+   테스트가 바꿔 끼워 쓰기 실패, 되돌리기 실패, 할당 실패를 만듭니다. */
 struct table_file_functions {
     ssize_t (*write_at)(int fd, const void *bytes, size_t size, off_t offset);
     int (*truncate)(int fd, off_t size);
+    void *(*allocate)(size_t size);
 };
 
 extern struct table_file_functions table_file_functions;

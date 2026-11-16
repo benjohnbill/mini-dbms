@@ -31,6 +31,7 @@ struct table_scan {
 struct table_file_functions table_file_functions = {
     .write_at = pwrite,
     .truncate = ftruncate,
+    .allocate = malloc,
 };
 
 static void error_set(char *error, size_t error_size, const char *format, ...);
@@ -129,7 +130,7 @@ enum table_insert_status table_insert(struct table *table,
     }
     new_id = table->last_id + 1;
     /* 1단계: 파일을 건드리기 전에 메모리 할당을 모두 끝냅니다. */
-    bytes = malloc(size);
+    bytes = table_file_functions.allocate(size);
     if (bytes == NULL) {
         error_set(error, error_size, "out of memory");
         return TABLE_INSERT_OUT_OF_MEMORY;

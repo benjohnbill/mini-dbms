@@ -44,6 +44,7 @@ static int failing_ftruncate(int fd, off_t size);
 static ssize_t small_interrupted_pwrite(int fd, const void *bytes, size_t size,
                                         off_t offset);
 static void check_only_kim(struct engine *engine);
+static void *failing_malloc(size_t size);
 static struct engine *users_and_items_engine_create(void);
 static void check_table_unavailable(struct engine_result *result);
 
@@ -531,6 +532,41 @@ static void real_file_size_limit_rolls_back_insert_test(void)
     data_dir_remove();
 }
 
+static void failed_allocation_keeps_file_and_id_test(void)
+{
+    struct engine *engine = users_engine_create();
+    struct engine_result *result =
+        execute_one(engine, "INSERT INTO users VALUES ('kim', 'k@x', 20);");
+    size_t before_size;
+    size_t after_size;
+    unsigned char *before;
+    unsigned char *after;
+
+    engine_result_destroy(result);
+    before = file_bytes_create("users.tbl", &before_size);
+
+    table_file_functions.allocate = failing_malloc;
+    result =
+        execute_one(engine, "INSERT INTO users VALUES ('lee', 'l@x', 31);");
+    table_file_functions.allocate = malloc;
+    TEST_CHECK(result->status == ENGINE_ERROR);
+    TEST_CHECK(result->error_reason == ENGINE_REASON_OUT_OF_MEMORY);
+    engine_result_destroy(result);
+
+    after = file_bytes_create("users.tbl", &after_size);
+    TEST_CHECK(after_size == before_size &&
+               memcmp(before, after, before_size) == 0);
+    free(before);
+    free(after);
+    result =
+        execute_one(engine, "INSERT INTO users VALUES ('lee', 'l@x', 31);");
+    TEST_CHECK(result->inserted_id == 2);
+    engine_result_destroy(result);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
 TEST_LIST = {
     {"[T6] INSERT는 ID 1을 받고 SELECT *가 그 record를 돌려준다",
      insert_returns_id_and_select_returns_record_test},
@@ -576,6 +612,9 @@ TEST_LIST = {
     {"[T85] 파일 크기 상한에 걸린 실제 쓰기 실패도 INSERT를 되돌리고 ID를 "
      "쓰지 않는다",
      real_file_size_limit_rolls_back_insert_test},
+    {"[T86] record 버퍼 할당이 실패하면 INSERT는 out_of_memory이고 테이블 "
+     "파일과 ID가 그대로다",
+     failed_allocation_keeps_file_and_id_test},
     {NULL, NULL},
 };
 
@@ -743,4 +782,10 @@ static void check_only_kim(struct engine *engine)
     check_text(&result->values[2], "k@x");
     TEST_CHECK(result->values[3].integer == 20);
     engine_result_destroy(result);
+}
+
+static void *failing_malloc(size_t size)
+{
+    (void)size;
+    return NULL;
 }
