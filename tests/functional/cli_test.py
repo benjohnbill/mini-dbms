@@ -216,9 +216,9 @@ TESTS = [
     ("SQL 실행 오류는 종료 코드 1로 끝난다", sql_error_exits_1),
     ("INSERT 세 개 뒤 CLI를 다시 실행하면 세 record가 조회되고 다음 INSERT는 ID 4를 받는다",
      rerun_keeps_records_and_next_id_is_4),
-    ("[T23] 다른 프로세스가 데이터 폴더를 잠근 동안 CLI는 종료 코드 1로 끝나고, 잠금이 풀리면 실행된다",
+    ("다른 프로세스가 데이터 폴더를 잠근 동안 CLI는 종료 코드 1로 끝나고, 잠금이 풀리면 실행된다",
      locked_data_dir_exits_1_until_lock_is_released),
-    ("[T24] dump는 같은 테이블의 SELECT *와 같은 TSV를 출력한다",
+    ("dump는 같은 테이블의 SELECT *와 같은 TSV를 출력한다",
      dump_prints_same_tsv_as_select_star),
     ("없는 테이블의 dump는 종료 코드 1로 끝난다", dump_of_unknown_table_exits_1),
 ]

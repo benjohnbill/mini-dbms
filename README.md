@@ -88,7 +88,17 @@ id	name	email	age
 1	kim	kim@example.com	20
 ```
 
-최종 PRD가 정한 CLI에는 INSERT 결과 출력을 끄는 `-q`, stderr의 메타 줄(티켓 02), 바이너리 데이터 파일을 사람이 읽는 줄로 보는 `dump` 명령(티켓 03)이 더해집니다.
+데이터 파일은 바이너리라 에디터로 읽을 수 없습니다. `dump` 명령은 테이블 하나의 record를 `SELECT * FROM <테이블>;`과 같은 TSV로 stdout에 씁니다. 없는 테이블이면 종료 코드 1입니다.
+
+```text
+mini-dbms [--data 폴더] dump <테이블>
+```
+
+```bash
+./build/mini-dbms dump users
+```
+
+최종 PRD가 정한 CLI에는 INSERT 결과 출력을 끄는 `-q`와 stderr의 메타 줄(티켓 02)이 더해집니다.
 
 필요한 검사만 따로 실행할 수도 있습니다.
 
