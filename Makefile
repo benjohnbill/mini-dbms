@@ -9,8 +9,9 @@ endif
 # ASan과 UBSan은 메모리 오류와 정의되지 않은 동작을 테스트 중에 바로 멈춰 세웁니다.
 # -MMD -MP는 .o마다 읽은 헤더 목록(.d)을 남겨, 헤더만 고쳐도 다시 빌드되게 합니다.
 CFLAGS   := -std=c11 -Wall -Wextra -Werror -g -fno-omit-frame-pointer \
-            -fsanitize=address,undefined -fno-sanitize-recover=all -MMD -MP
-LDFLAGS  := -fsanitize=address,undefined
+            -fsanitize=address,undefined -fno-sanitize-recover=all -MMD -MP \
+            -pthread
+LDFLAGS  := -fsanitize=address,undefined -pthread
 
 BUILD    := build
 
