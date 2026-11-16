@@ -11,12 +11,24 @@ permissions:
 
 jobs:
   verify:
-    name: verify
-    runs-on: ubuntu-latest
+    name: verify (${{ matrix.os }})
+    # 최종 PRD: macOS와 Linux에서 같은 테스트가 같은 결과를 내야 합니다.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       # 러너 커널의 주소 무작위화 비트가 크면 AddressSanitizer가 시작하지 못하는 경우가 있어 줄입니다.
-      - run: sudo sysctl vm.mmap_rnd_bits=28
+      # Linux 커널 설정이라 Linux에서만 실행합니다.
+      - if: runner.os == 'Linux'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      # 두 OS에서 같은 python과 pip를 쓰게 합니다. macOS의 Homebrew python은
+      # 전역 pip install을 막습니다.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       # make verify의 lint가 씁니다. 버전이 다르면 모양 판정이 달라지므로
       # CONVENTION.md의 설치 명령과 같은 버전을 씁니다.
       - run: pip install clang-format==21.1.8 clang-tidy==21.1.6
