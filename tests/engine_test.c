@@ -1,9 +1,11 @@
 #include <dirent.h>
 #include <errno.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include "acutest.h"
@@ -39,6 +41,9 @@ static ssize_t part_then_fail_pwrite(int fd, const void *bytes, size_t size,
                                      off_t offset);
 
 static int failing_ftruncate(int fd, off_t size);
+static ssize_t small_interrupted_pwrite(int fd, const void *bytes, size_t size,
+                                        off_t offset);
+static void check_only_kim(struct engine *engine);
 static struct engine *users_and_items_engine_create(void);
 static void check_table_unavailable(struct engine_result *result);
 
@@ -443,6 +448,89 @@ static void stopped_table_leaves_other_tables_working_test(void)
     data_dir_remove();
 }
 
+static void select_after_rollback_returns_records_before_failure_test(void)
+{
+    struct engine *engine = users_engine_create();
+    struct engine_result *result =
+        execute_one(engine, "INSERT INTO users VALUES ('kim', 'k@x', 20);");
+
+    engine_result_destroy(result);
+    table_file_functions.write_at = part_then_fail_pwrite;
+    result =
+        execute_one(engine, "INSERT INTO users VALUES ('lee', 'l@x', 31);");
+    table_file_functions.write_at = pwrite;
+    TEST_CHECK(result->status == ENGINE_ERROR);
+    engine_result_destroy(result);
+
+    check_only_kim(engine);
+    engine_destroy(engine);
+    engine = engine_reopen();
+    check_only_kim(engine);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
+static void short_and_interrupted_writes_make_one_record_test(void)
+{
+    struct engine *engine = users_engine_create();
+    struct engine_result *result;
+
+    table_file_functions.write_at = small_interrupted_pwrite;
+    result =
+        execute_one(engine, "INSERT INTO users VALUES ('kim', 'k@x', 20);");
+    table_file_functions.write_at = pwrite;
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_CHECK(result->inserted_id == 1);
+    engine_result_destroy(result);
+    /* 길이 4 + id 8 + 'kim' 4+3 + 'k@x' 4+3 + age 8 */
+    TEST_CHECK(file_size_get("users.tbl") == 34);
+
+    check_only_kim(engine);
+    engine_destroy(engine);
+    engine = engine_reopen();
+    check_only_kim(engine);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
+/* 함수 표를 바꾸지 않고 실제 pwrite가 EFBIG로 실패하게 합니다. 파일 크기
+   상한을 지금 크기로 두면 다음 쓰기가 실패합니다. 상한을 넘는 쓰기는
+   SIGXFSZ를 보내므로 무시합니다. */
+static void real_file_size_limit_rolls_back_insert_test(void)
+{
+    struct engine *engine = users_engine_create();
+    struct engine_result *result =
+        execute_one(engine, "INSERT INTO users VALUES ('kim', 'k@x', 20);");
+    struct rlimit old_limit;
+    struct rlimit new_limit;
+
+    engine_result_destroy(result);
+    TEST_ASSERT(getrlimit(RLIMIT_FSIZE, &old_limit) == 0);
+    new_limit = old_limit;
+    new_limit.rlim_cur = (rlim_t)file_size_get("users.tbl");
+    signal(SIGXFSZ, SIG_IGN);
+    TEST_ASSERT(setrlimit(RLIMIT_FSIZE, &new_limit) == 0);
+    result =
+        execute_one(engine, "INSERT INTO users VALUES ('lee', 'l@x', 31);");
+    TEST_ASSERT(setrlimit(RLIMIT_FSIZE, &old_limit) == 0);
+    signal(SIGXFSZ, SIG_DFL);
+
+    TEST_CHECK(result->status == ENGINE_ERROR);
+    TEST_CHECK(result->error_reason == ENGINE_REASON_STORAGE_ERROR);
+    TEST_MSG("error: %s", result->error_message);
+    engine_result_destroy(result);
+    TEST_CHECK(file_size_get("users.tbl") == 34);
+    result =
+        execute_one(engine, "INSERT INTO users VALUES ('lee', 'l@x', 31);");
+    TEST_CHECK(result->inserted_id == 2);
+    engine_result_destroy(result);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
 TEST_LIST = {
     {"[T6] INSERT는 ID 1을 받고 SELECT *가 그 record를 돌려준다",
      insert_returns_id_and_select_returns_record_test},
@@ -479,6 +567,15 @@ TEST_LIST = {
      failed_rollback_stops_table_test},
     {"[T82] 한 테이블이 멈춰도 다른 테이블의 INSERT와 SELECT는 성공한다",
      stopped_table_leaves_other_tables_working_test},
+    {"[T83] 쓰기가 실패하고 되돌린 뒤의 SELECT는 재시작 전후 모두 실패 전과 "
+     "같은 record를 돌려준다",
+     select_after_rollback_returns_records_before_failure_test},
+    {"[T84] 일부만 쓰이거나 EINTR로 끊긴 쓰기는 이어 써서 완전한 record "
+     "하나가 된다",
+     short_and_interrupted_writes_make_one_record_test},
+    {"[T85] 파일 크기 상한에 걸린 실제 쓰기 실패도 INSERT를 되돌리고 ID를 "
+     "쓰지 않는다",
+     real_file_size_limit_rolls_back_insert_test},
     {NULL, NULL},
 };
 
@@ -616,5 +713,34 @@ static void check_table_unavailable(struct engine_result *result)
     TEST_CHECK(result->error_reason == ENGINE_REASON_TABLE_UNAVAILABLE);
     TEST_MSG("reason: %d, error: %s", (int)result->error_reason,
              result->error_message);
+    engine_result_destroy(result);
+}
+
+/* 한 번에 3바이트까지만 쓰고, 그 사이 호출마다 EINTR로 끊깁니다. */
+static ssize_t small_interrupted_pwrite(int fd, const void *bytes, size_t size,
+                                        off_t offset)
+{
+    static bool interrupt_next = true;
+
+    if (interrupt_next) {
+        interrupt_next = false;
+        errno = EINTR;
+        return -1;
+    }
+    interrupt_next = true;
+    return pwrite(fd, bytes, size < 3 ? size : 3, offset);
+}
+
+/* SELECT *가 ('kim', 'k@x', 20) record 하나만 돌려주는지 확인합니다. */
+static void check_only_kim(struct engine *engine)
+{
+    struct engine_result *result = execute_one(engine, "SELECT * FROM users;");
+
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_ASSERT(result->record_count == 1);
+    TEST_CHECK(result->values[0].integer == 1);
+    check_text(&result->values[1], "kim");
+    check_text(&result->values[2], "k@x");
+    TEST_CHECK(result->values[3].integer == 20);
     engine_result_destroy(result);
 }
