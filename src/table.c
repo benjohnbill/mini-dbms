@@ -39,7 +39,7 @@ static int table_records_load(struct table *table, char *error,
                               size_t error_size);
 static size_t record_size(const struct table *table,
                           const struct value *values);
-static void record_encode(const struct table *table, int64_t record_id,
+static void record_encode(const struct table *table, int64_t new_id,
                           const struct value *values, unsigned char *bytes);
 static unsigned char *put_u32(unsigned char *bytes, uint32_t number);
 static unsigned char *put_i64(unsigned char *bytes, int64_t number);
@@ -317,13 +317,13 @@ static size_t record_size(const struct table *table, const struct value *values)
     return size;
 }
 
-static void record_encode(const struct table *table, int64_t record_id,
+static void record_encode(const struct table *table, int64_t new_id,
                           const struct value *values, unsigned char *bytes)
 {
     size_t body_len = record_size(table, values) - LENGTH_BYTES;
     unsigned char *cursor = put_u32(bytes, (uint32_t)body_len);
 
-    cursor = put_i64(cursor, record_id);
+    cursor = put_i64(cursor, new_id);
     for (size_t i = 0; i < table->field_count; i++) {
         if (values[i].type == VALUE_INT) {
             cursor = put_i64(cursor, values[i].integer);
