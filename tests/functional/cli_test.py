@@ -4,8 +4,11 @@
 사용법: python3 tests/functional/cli_test.py <CLI 경로>
 """
 
+import fcntl
 import os
 import re
+import resource
+import signal
 import shutil
 import subprocess
 import sys
@@ -225,6 +228,27 @@ def meta_lines_go_to_stderr_one_per_statement():
         shutil.rmtree(data_dir)
 
 
+def rerun_keeps_records_and_next_id_is_4():
+    data_dir = make_data_dir()
+    try:
+        proc = run_sql(data_dir,
+                       "INSERT INTO users VALUES ('a', 'a@x', 1);\n"
+                       "INSERT INTO users VALUES ('b', 'b@x', 2);\n"
+                       "INSERT INTO users VALUES ('c', 'c@x', 3);\n")
+        assert proc.returncode == 0, proc.stderr
+        proc = run_sql(data_dir,
+                       "INSERT INTO users VALUES ('d', 'd@x', 4);\n"
+                       "SELECT * FROM users;\n")
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == (b"id\tname\temail\tage\n"
+                               b"1\ta\ta@x\t1\n"
+                               b"2\tb\tb@x\t2\n"
+                               b"3\tc\tc@x\t3\n"
+                               b"4\td\td@x\t4\n"), proc.stdout
+    finally:
+        shutil.rmtree(data_dir)
+
+
 def quiet_option_hides_insert_meta_lines_only():
     data_dir = make_data_dir()
     try:
@@ -238,6 +262,95 @@ def quiet_option_hides_insert_meta_lines_only():
         lines = proc.stderr.decode("utf-8").splitlines()
         assert not any(META_INSERT.match(line) for line in lines), lines
         assert len(lines) == 1 and META_SELECT.match(lines[0]), lines
+    finally:
+        shutil.rmtree(data_dir)
+
+
+def locked_data_dir_exits_1_until_lock_is_released():
+    data_dir = make_data_dir()
+    try:
+        # 첫 프로세스 자리를 테스트가 맡습니다. 엔진과 같은 잠금 파일에 같은 flock을 쥡니다.
+        with open(os.path.join(data_dir, ".lock"), "w") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            proc = run_sql(data_dir, "SELECT * FROM users;")
+            assert proc.returncode == 1, proc.returncode
+            assert b"in use" in proc.stderr, proc.stderr
+        proc = run_sql(data_dir, "SELECT * FROM users;")
+        assert proc.returncode == 0, proc.stderr
+    finally:
+        shutil.rmtree(data_dir)
+
+
+def dump_prints_same_tsv_as_select_star():
+    data_dir = make_data_dir()
+    try:
+        proc = run_sql(data_dir,
+                       "INSERT INTO users VALUES ('a\tb', 'O''Brien', 1);\n"
+                       "INSERT INTO users VALUES ('c', 'd\ne', -2);\n")
+        assert proc.returncode == 0, proc.stderr
+        select = run_sql(data_dir, "SELECT * FROM users;")
+        dump = run_cli(["--data", data_dir, "dump", "users"])
+        assert dump.returncode == 0, dump.stderr
+        assert dump.stdout == select.stdout, (dump.stdout, select.stdout)
+        assert dump.stdout.count(b"\n") == 3, dump.stdout
+    finally:
+        shutil.rmtree(data_dir)
+
+
+def dump_of_unknown_table_exits_1():
+    data_dir = make_data_dir()
+    try:
+        proc = run_cli(["--data", data_dir, "dump", "nobody"])
+        assert proc.returncode == 1, proc.returncode
+        assert proc.stderr
+    finally:
+        shutil.rmtree(data_dir)
+
+
+def failed_write_exits_1_and_keeps_table_file():
+    data_dir = make_data_dir()
+    table_path = os.path.join(data_dir, "users.tbl")
+    try:
+        assert run_sql(data_dir, "INSERT INTO users VALUES ('kim', 'k@x', 20);\n").returncode == 0
+        with open(table_path, "rb") as f:
+            before = f.read()
+
+        def limit_file_size():
+            # 테이블 파일의 지금 크기를 상한으로 두면 다음 쓰기가 EFBIG로 실패합니다.
+            signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+            resource.setrlimit(resource.RLIMIT_FSIZE, (len(before), resource.RLIM_INFINITY))
+
+        sql_path = os.path.join(data_dir, "input.sql")
+        with open(sql_path, "w", encoding="utf-8") as f:
+            f.write("INSERT INTO users VALUES ('lee', 'l@x', 31);\n")
+        proc = subprocess.run([CLI, "--data", data_dir, sql_path],
+                              capture_output=True, preexec_fn=limit_file_size)
+        assert proc.returncode == 1, proc.returncode
+        assert b"users.tbl" in proc.stderr, proc.stderr
+        with open(table_path, "rb") as f:
+            assert f.read() == before
+    finally:
+        shutil.rmtree(data_dir)
+
+
+def truncated_table_file_exits_1_and_keeps_file():
+    data_dir = make_data_dir()
+    try:
+        proc = run_sql(data_dir, "INSERT INTO users VALUES ('kim', 'k@x', 20);\n")
+        assert proc.returncode == 0, proc.stderr
+        table_path = os.path.join(data_dir, "users.tbl")
+        with open(table_path, "ab") as f:
+            f.write(b"\x20\x00")
+        with open(table_path, "rb") as f:
+            before = f.read()
+        proc = run_sql(data_dir, "SELECT * FROM users;")
+        assert proc.returncode == 1, proc.returncode
+        message = proc.stderr.decode("utf-8")
+        # 첫 record는 길이 칸 4 + id 8 + "kim" 4 + 3 + "k@x" 4 + 3 + age 8 = 34바이트입니다.
+        for expected in ("users.tbl", "34번째 바이트", "record(2번째)", "잘림"):
+            assert expected in message, message
+        with open(table_path, "rb") as f:
+            assert f.read() == before
     finally:
         shutil.rmtree(data_dir)
 
@@ -267,6 +380,18 @@ TESTS = [
      meta_lines_go_to_stderr_one_per_statement),
     ("[T18] -q는 INSERT 메타 줄만 끄고 SELECT 결과와 메타 줄은 그대로 둔다",
      quiet_option_hides_insert_meta_lines_only),
+    ("[T87] 테이블 파일 쓰기가 실패하면 CLI는 stderr에 오류를 쓰고 종료 코드 1로 끝나며 테이블 파일은 그대로다",
+     failed_write_exits_1_and_keeps_table_file),
+    ("INSERT 세 개 뒤 CLI를 다시 실행하면 세 record가 조회되고 다음 INSERT는 ID 4를 받는다",
+     rerun_keeps_records_and_next_id_is_4),
+    ("다른 프로세스가 데이터 폴더를 잠근 동안 CLI는 종료 코드 1로 끝나고, 잠금이 풀리면 실행된다",
+     locked_data_dir_exits_1_until_lock_is_released),
+    ("dump는 같은 테이블의 SELECT *와 같은 TSV를 출력한다",
+     dump_prints_same_tsv_as_select_star),
+    ("없는 테이블의 dump는 종료 코드 1로 끝난다", dump_of_unknown_table_exits_1),
+    ("[T66] 잘린 테이블 파일이면 CLI는 파일 이름, 바이트 위치, record 번호, 잘림을 "
+     "알리고 종료 코드 1로 끝나며 파일을 고치지 않는다",
+     truncated_table_file_exits_1_and_keeps_file),
 ]
 
 

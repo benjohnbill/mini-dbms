@@ -2,27 +2,36 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 #include "sql.h"
 #include "table.h"
 
 #define SCHEMA_SUFFIX ".schema"
+#define LOCK_FILE_NAME ".lock"
+#define LOCK_PATH_BYTES 1024
 
+/* lock_fd는 잠금 파일을 연 fd이고, 닫으면 잠금이 풀립니다. */
 struct engine {
+    int lock_fd;
     struct table **tables;
     size_t table_count;
 };
 
+static int engine_lock_data_dir(struct engine *engine, const char *data_dir,
+                                char *error, size_t error_size);
 static int engine_load_tables(struct engine *engine, const char *data_dir,
                               char *error, size_t error_size);
 static int engine_add_table(struct engine *engine, struct table *table);
 static void result_fail(struct engine_result *result,
-                        enum engine_error_code code, const char *format, ...);
+                        enum engine_error_reason code, const char *format, ...);
 static void result_set_sql_error(struct engine_result *result,
                                  const struct sql_error *sql_error);
 static struct table *engine_find_table(const struct engine *engine,
@@ -40,6 +49,8 @@ static int where_check(struct engine_result *result, const struct table *table,
 static struct value record_field(const struct record *record, size_t source);
 static const char *value_type_name(enum value_type type);
 static bool value_equal(const struct value *left, const struct value *right);
+static enum engine_error_reason
+insert_error_reason(enum table_insert_status insert_status);
 static int result_set_fields(struct engine_result *result,
                              const struct table *table,
                              const struct statement *statement,
@@ -59,7 +70,11 @@ struct engine *engine_create(const char *data_dir,
         snprintf(error, error_size, "메모리가 부족합니다");
         return NULL;
     }
-    if (engine_load_tables(engine, data_dir, error, error_size) != 0) {
+    engine->lock_fd = -1;
+    /* 다른 프로세스가 같은 파일을 쓰는 중에 읽지 않도록, 스키마와 테이블
+       파일을 읽기 전에 잠급니다. */
+    if (engine_lock_data_dir(engine, data_dir, error, error_size) != 0 ||
+        engine_load_tables(engine, data_dir, error, error_size) != 0) {
         engine_destroy(engine);
         return NULL;
     }
@@ -96,8 +111,13 @@ struct engine_result *engine_execute(struct engine *engine, const char *sql,
     result->error_byte_in_line = statement->byte_in_line;
     table = engine_find_table(engine, statement->table);
     if (table == NULL) {
-        result_fail(result, ENGINE_ERROR_NO_TABLE, "없는 테이블입니다: %s",
+        result_fail(result, ENGINE_REASON_NO_TABLE, "없는 테이블입니다: %s",
                     statement->table);
+    } else if (!table->available) {
+        /* 되돌리기가 실패한 테이블은 파일 상태를 알 수 없으므로 읽지도
+           쓰지도 않습니다. 재시작하면 시작할 때 읽기가 파일을 판정합니다. */
+        result_fail(result, ENGINE_REASON_TABLE_UNAVAILABLE,
+                    "%s: table is unavailable until restart", statement->table);
     } else if (statement->kind == STATEMENT_INSERT) {
         execute_insert(table, statement, result);
     } else {
@@ -135,7 +155,36 @@ void engine_destroy(struct engine *engine)
         table_destroy(engine->tables[i]);
     }
     free(engine->tables);
+    if (engine->lock_fd >= 0) {
+        close(engine->lock_fd);
+    }
     free(engine);
+}
+
+/* 데이터 폴더의 잠금 파일에 비차단 배타 flock을 겁니다. flock은 열린 파일마다
+   잠그므로 같은 프로세스의 두 번째 엔진도 실패하고, 프로세스가 끝나면 커널이
+   잠금을 풉니다. */
+static int engine_lock_data_dir(struct engine *engine, const char *data_dir,
+                                char *error, size_t error_size)
+{
+    char path[LOCK_PATH_BYTES];
+
+    snprintf(path, sizeof(path), "%s/%s", data_dir, LOCK_FILE_NAME);
+    engine->lock_fd = open(path, O_RDWR | O_CREAT, 0644);
+    if (engine->lock_fd < 0) {
+        snprintf(error, error_size, "%s: %s", path, strerror(errno));
+        return -1;
+    }
+    if (flock(engine->lock_fd, LOCK_EX | LOCK_NB) != 0) {
+        if (errno == EWOULDBLOCK) {
+            snprintf(error, error_size,
+                     "%s: data folder is in use by another process", data_dir);
+        } else {
+            snprintf(error, error_size, "%s: %s", path, strerror(errno));
+        }
+        return -1;
+    }
+    return 0;
 }
 
 /* 데이터 폴더의 <테이블>.schema마다 테이블 하나를 엽니다. */
@@ -190,12 +239,12 @@ static int engine_add_table(struct engine *engine, struct table *table)
 }
 
 static void result_fail(struct engine_result *result,
-                        enum engine_error_code code, const char *format, ...)
+                        enum engine_error_reason code, const char *format, ...)
 {
     va_list args;
 
     result->status = ENGINE_ERROR;
-    result->error_code = code;
+    result->error_reason = code;
     va_start(args, format);
     vsnprintf(result->error_message, sizeof(result->error_message), format,
               args);
@@ -205,11 +254,11 @@ static void result_fail(struct engine_result *result,
 static void result_set_sql_error(struct engine_result *result,
                                  const struct sql_error *sql_error)
 {
-    static const enum engine_error_code codes[] = {
-        [SQL_ERROR_SYNTAX] = ENGINE_ERROR_SYNTAX,
-        [SQL_ERROR_INT_RANGE] = ENGINE_ERROR_INT_RANGE,
-        [SQL_ERROR_TEXT_TOO_LONG] = ENGINE_ERROR_TEXT_TOO_LONG,
-        [SQL_ERROR_NO_MEMORY] = ENGINE_ERROR_NO_MEMORY,
+    static const enum engine_error_reason codes[] = {
+        [SQL_ERROR_SYNTAX] = ENGINE_REASON_SYNTAX,
+        [SQL_ERROR_INT_RANGE] = ENGINE_REASON_INT_RANGE,
+        [SQL_ERROR_TEXT_TOO_LONG] = ENGINE_REASON_TEXT_TOO_LONG,
+        [SQL_ERROR_NO_MEMORY] = ENGINE_REASON_OUT_OF_MEMORY,
     };
 
     result_fail(result, codes[sql_error->code], "%s", sql_error->message);
@@ -233,10 +282,12 @@ static void execute_insert(struct table *table,
                            const struct statement *statement,
                            struct engine_result *result)
 {
+    enum table_insert_status insert_status;
+
     result->kind = ENGINE_STATEMENT_INSERT;
     if (statement->value_count != table->field_count) {
         result_fail(
-            result, ENGINE_ERROR_VALUE_COUNT,
+            result, ENGINE_REASON_VALUE_COUNT,
             "%s에는 값 %zu개가 와야 하는데 %zu개입니다(id는 적지 않습니다)",
             table->name, table->field_count, statement->value_count);
         return;
@@ -244,19 +295,35 @@ static void execute_insert(struct table *table,
     for (size_t i = 0; i < table->field_count; i++) {
         if (statement->values[i].type != table->fields[i].type) {
             result_fail(
-                result, ENGINE_ERROR_TYPE, "%s field에는 %s 값이 와야 합니다",
+                result, ENGINE_REASON_TYPE, "%s field에는 %s 값이 와야 합니다",
                 table->fields[i].name, value_type_name(table->fields[i].type));
             return;
         }
     }
-    if (table_insert(table, statement->values, &result->inserted_id,
-                     result->error_message,
-                     sizeof(result->error_message)) != 0) {
+    insert_status =
+        table_insert(table, statement->values, &result->inserted_id,
+                     result->error_message, sizeof(result->error_message));
+    if (insert_status != TABLE_INSERT_OK) {
         result->status = ENGINE_ERROR;
-        result->error_code = ENGINE_ERROR_STORAGE;
+        result->error_reason = insert_error_reason(insert_status);
         return;
     }
     result->status = ENGINE_OK;
+}
+
+static enum engine_error_reason
+insert_error_reason(enum table_insert_status insert_status)
+{
+    switch (insert_status) {
+    case TABLE_INSERT_OUT_OF_MEMORY:
+        return ENGINE_REASON_OUT_OF_MEMORY;
+    case TABLE_INSERT_STORAGE_ERROR:
+        return ENGINE_REASON_STORAGE_ERROR;
+    case TABLE_INSERT_UNAVAILABLE:
+        return ENGINE_REASON_TABLE_UNAVAILABLE;
+    default:
+        return ENGINE_REASON_NONE;
+    }
 }
 
 static void execute_select(struct table *table,
@@ -274,14 +341,15 @@ static void execute_select(struct table *table,
     result->kind = ENGINE_STATEMENT_SELECT;
     result->access_path = ENGINE_ACCESS_PATH_SCAN;
     if (sources == NULL) {
-        result_fail(result, ENGINE_ERROR_NO_MEMORY, "메모리가 부족합니다");
+        result_fail(result, ENGINE_REASON_OUT_OF_MEMORY, "메모리가 부족합니다");
         return;
     }
     if (result_set_fields(result, table, statement, sources) == 0 &&
         where_check(result, table, statement, &where_source) == 0) {
         iterator = table_scan_create(table);
         if (iterator == NULL) {
-            result_fail(result, ENGINE_ERROR_NO_MEMORY, "메모리가 부족합니다");
+            result_fail(result, ENGINE_REASON_OUT_OF_MEMORY,
+                        "메모리가 부족합니다");
         }
     }
     if (iterator == NULL) {
@@ -306,8 +374,8 @@ static void execute_select(struct table *table,
     iterator->destroy(iterator);
     free(sources);
     if (status != 0) {
-        result_fail(result, ENGINE_ERROR_STORAGE, "%s.tbl을 읽지 못했습니다",
-                    table->name);
+        result_fail(result, ENGINE_REASON_STORAGE_ERROR,
+                    "%s.tbl을 읽지 못했습니다", table->name);
         return;
     }
     result->status = ENGINE_OK;
@@ -342,14 +410,14 @@ static int where_check(struct engine_result *result, const struct table *table,
         return 0;
     }
     if (!table_find_field(table, statement->where_field, where_source)) {
-        result_fail(result, ENGINE_ERROR_NO_FIELD, "없는 field입니다: %s",
+        result_fail(result, ENGINE_REASON_NO_FIELD, "없는 field입니다: %s",
                     statement->where_field);
         return -1;
     }
     type =
         *where_source == 0 ? VALUE_INT : table->fields[*where_source - 1].type;
     if (statement->where_value.type != type) {
-        result_fail(result, ENGINE_ERROR_TYPE,
+        result_fail(result, ENGINE_REASON_TYPE,
                     "%s field에는 %s 값이 와야 합니다", statement->where_field,
                     value_type_name(type));
         return -1;
@@ -390,7 +458,7 @@ static int result_set_fields(struct engine_result *result,
 
     result->field_names = calloc(field_count, sizeof(*result->field_names));
     if (result->field_names == NULL) {
-        result_fail(result, ENGINE_ERROR_NO_MEMORY, "메모리가 부족합니다");
+        result_fail(result, ENGINE_REASON_OUT_OF_MEMORY, "메모리가 부족합니다");
         return -1;
     }
     result->field_count = field_count;
@@ -402,7 +470,7 @@ static int result_set_fields(struct engine_result *result,
             name = i == 0 ? "id" : table->fields[i - 1].name;
         } else if (!table_find_field(table, statement->fields[i],
                                      &sources[i])) {
-            result_fail(result, ENGINE_ERROR_NO_FIELD, "없는 field입니다: %s",
+            result_fail(result, ENGINE_REASON_NO_FIELD, "없는 field입니다: %s",
                         statement->fields[i]);
             return -1;
         } else {
@@ -410,7 +478,8 @@ static int result_set_fields(struct engine_result *result,
         }
         result->field_names[i] = strdup(name);
         if (result->field_names[i] == NULL) {
-            result_fail(result, ENGINE_ERROR_NO_MEMORY, "메모리가 부족합니다");
+            result_fail(result, ENGINE_REASON_OUT_OF_MEMORY,
+                        "메모리가 부족합니다");
             return -1;
         }
     }

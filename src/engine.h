@@ -24,24 +24,26 @@ enum engine_status {
     ENGINE_ERROR,
 };
 
+/* 기계가 읽는 오류 이유입니다. API 서버가 상태 코드와 응답의 error 값을
+   고를 때 씁니다. 성공과 문장 없음은 ENGINE_REASON_NONE입니다. */
+enum engine_error_reason {
+    ENGINE_REASON_NONE,
+    ENGINE_REASON_SYNTAX,
+    ENGINE_REASON_NO_TABLE,
+    ENGINE_REASON_NO_FIELD,
+    ENGINE_REASON_VALUE_COUNT,
+    ENGINE_REASON_TYPE,
+    ENGINE_REASON_INT_RANGE,
+    ENGINE_REASON_TEXT_TOO_LONG,
+    ENGINE_REASON_OUT_OF_MEMORY,
+    ENGINE_REASON_STORAGE_ERROR, /* 테이블 파일 읽기와 쓰기 */
+    ENGINE_REASON_TABLE_UNAVAILABLE,
+};
+
 enum engine_statement_kind {
     ENGINE_STATEMENT_NONE,
     ENGINE_STATEMENT_INSERT,
     ENGINE_STATEMENT_SELECT,
-};
-
-/* 오류의 종류입니다. API 서버는 이 값으로 응답을 고릅니다. */
-enum engine_error_code {
-    ENGINE_ERROR_NONE,
-    ENGINE_ERROR_SYNTAX,
-    ENGINE_ERROR_NO_TABLE,
-    ENGINE_ERROR_NO_FIELD,
-    ENGINE_ERROR_VALUE_COUNT,
-    ENGINE_ERROR_TYPE,
-    ENGINE_ERROR_INT_RANGE,
-    ENGINE_ERROR_TEXT_TOO_LONG,
-    ENGINE_ERROR_STORAGE, /* 테이블 파일 읽기와 쓰기 */
-    ENGINE_ERROR_NO_MEMORY,
 };
 
 /* SELECT가 record를 찾은 방법입니다. 지금은 SCAN뿐이고 티켓 07이 INDEX를
@@ -55,7 +57,7 @@ enum engine_access_path {
 struct engine_result {
     enum engine_status status;
     enum engine_statement_kind kind;
-    enum engine_error_code error_code;
+    enum engine_error_reason error_reason;
     /* 오류 위치입니다. engine_execute가 받은 sql의 첫 줄을 1로 셉니다.
        파일 안의 줄 번호는 부르는 쪽이 앞의 줄 수를 더해 구합니다. */
     size_t error_line;
