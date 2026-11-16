@@ -1,8 +1,11 @@
-/* DB 엔진의 공개 인터페이스입니다. CLI, API 서버, 테스트는 이 네 함수만
-   부릅니다. 결과 구조체에는 칸을 더할 수 있지만 함수 모양은 바꾸지 않습니다. */
+/* DB 엔진의 공개 인터페이스입니다. CLI, API 서버, 테스트는 이 파일의
+   함수만 부릅니다. 기본 네 함수(만들기, 실행, 결과 해제, 엔진 해제)의
+   모양은 바꾸지 않고, 결과 구조체에는 칸을 더할 수 있습니다. 서버만 쓰는
+   커서 실행 함수(engine_execute_from)가 하나 더 있습니다. */
 #ifndef ENGINE_H
 #define ENGINE_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -14,8 +17,10 @@ struct engine;
 
 /* 엔진을 만들 때 정하는 옵션입니다. NULL을 넘기면 모든 칸이 0입니다.
    결과 상한은 SELECT 하나가 모을 수 있는 record 수와 값의 누적 바이트(INT는
-   8, TEXT는 바이트 길이)입니다. 넘으면 ENGINE_REASON_RESULT_TOO_LARGE로
-   끝납니다. 0은 상한을 두지 않는다는 뜻이고, CLI는 0을 씁니다. */
+   8, TEXT는 바이트 길이)입니다. 상한에 닿으면 SELECT는 거기까지의 record와
+   다음 record의 커서(next_cursor)를 돌려줍니다. record 하나가 바이트 상한보다
+   크면 나눌 수 없으므로 ENGINE_REASON_RESULT_TOO_LARGE로 끝납니다. 0은 상한을
+   두지 않는다는 뜻이고, CLI는 0을 씁니다. */
 struct engine_options {
     size_t max_records;
     size_t max_bytes;
@@ -42,8 +47,9 @@ enum engine_error_reason {
     ENGINE_REASON_STORAGE_ERROR, /* 테이블 파일 읽기와 쓰기 */
     ENGINE_REASON_TABLE_UNAVAILABLE,
     ENGINE_REASON_MULTIPLE_STATEMENTS, /* API 모드에서 문장 뒤에 다른 글자 */
-    ENGINE_REASON_RESULT_TOO_LARGE,    /* SELECT 결과가 결과 상한을 넘음 */
+    ENGINE_REASON_RESULT_TOO_LARGE,    /* record 하나가 바이트 상한을 넘음 */
     ENGINE_REASON_ID_EXHAUSTED,        /* 테이블의 ID가 INT 최댓값에 닿음 */
+    ENGINE_REASON_INVALID_CURSOR,      /* engine_execute_from의 커서가 틀림 */
 };
 
 enum engine_statement_kind {
@@ -77,6 +83,14 @@ struct engine_result {
     struct value *values;
     enum engine_access_path access_path;
     uint64_t records_examined; /* 조건을 보려고 읽은 record 수 */
+    /* record i가 테이블 파일에서 시작하는 바이트 위치입니다. 서버가 JSON
+       상한에서 결과를 자를 때 그 record의 커서로 씁니다. */
+    uint64_t *record_offsets;
+    /* SELECT가 결과 상한에 닿아 멈췄으면 참이고, next_cursor는 아직 돌려주지
+       않은 다음 record의 위치입니다. 이 값을 engine_execute_from에 넘기면
+       거기서부터 읽습니다. */
+    bool has_next_cursor;
+    uint64_t next_cursor;
 };
 
 /* data_dir의 스키마 파일과 테이블 파일을 엽니다. 실패하면 NULL을 돌려주고
@@ -92,6 +106,14 @@ struct engine *engine_create(const char *data_dir,
    없을 때만 NULL을 돌려줍니다. */
 struct engine_result *engine_execute(struct engine *engine, const char *sql,
                                      const char **next_sql);
+
+/* API 모드의 engine_execute와 같지만, SELECT의 SCAN을 테이블 파일의
+   cursor 위치에서 시작합니다. cursor는 record가 시작하는 위치이거나 파일
+   끝이어야 합니다. 그 밖의 위치, INDEX 경로를 쓰는 SELECT, INSERT는 실행하지
+   않고 ENGINE_REASON_INVALID_CURSOR로 끝냅니다. 테이블의 읽기 잠금은 이 호출
+   안에서만 쥡니다. */
+struct engine_result *engine_execute_from(struct engine *engine,
+                                          const char *sql, uint64_t cursor);
 
 void engine_result_destroy(struct engine_result *result);
 

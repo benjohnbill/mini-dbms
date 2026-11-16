@@ -43,8 +43,13 @@ static int engine_load_tables(struct engine *engine, const char *data_dir,
 static int engine_add_table(struct engine *engine, struct table *table);
 static int engine_init_table_locks(struct engine *engine, char *error,
                                    size_t error_size);
+static struct engine_result *execute_statement(struct engine *engine,
+                                               const char *sql,
+                                               const char **next_sql,
+                                               const uint64_t *cursor);
 static void execute_locked(const struct engine *engine, size_t table_index,
                            const struct statement *statement,
+                           const uint64_t *cursor,
                            struct engine_result *result);
 static void result_fail(struct engine_result *result,
                         enum engine_error_reason code, const char *format, ...);
@@ -59,13 +64,22 @@ static void execute_insert(struct table *table,
 static void execute_select(struct table *table,
                            const struct engine_options *options,
                            const struct statement *statement,
+                           const uint64_t *cursor,
                            struct engine_result *result);
+static struct record_iterator *
+select_iterator_create(struct table *table, const struct statement *statement,
+                       const uint64_t *cursor, struct engine_result *result);
+static bool cursor_is_valid(struct table *table, uint64_t cursor);
+static void select_part_end(struct engine_result *result,
+                            const struct engine_options *options,
+                            const struct record *record);
 static bool result_is_over_limit(const struct engine_result *result,
                                  const struct engine_options *options,
                                  size_t result_bytes);
 static size_t record_bytes_get(const struct engine_result *result,
                                size_t record_index);
 static void result_records_clear(struct engine_result *result);
+static void result_last_record_drop(struct engine_result *result);
 static bool table_find_field(const struct table *table, const char *name,
                              size_t *source);
 static int where_check(struct engine_result *result, const struct table *table,
@@ -113,6 +127,21 @@ struct engine *engine_create(const char *data_dir,
 struct engine_result *engine_execute(struct engine *engine, const char *sql,
                                      const char **next_sql)
 {
+    return execute_statement(engine, sql, next_sql, NULL);
+}
+
+struct engine_result *engine_execute_from(struct engine *engine,
+                                          const char *sql, uint64_t cursor)
+{
+    return execute_statement(engine, sql, NULL, &cursor);
+}
+
+/* cursor가 NULL이면 SELECT는 테이블 파일 처음부터 읽습니다. */
+static struct engine_result *execute_statement(struct engine *engine,
+                                               const char *sql,
+                                               const char **next_sql,
+                                               const uint64_t *cursor)
+{
     struct engine_result *result = calloc(1, sizeof(*result));
     struct statement *statement = NULL;
     const char *statement_end = sql;
@@ -146,8 +175,12 @@ struct engine_result *engine_execute(struct engine *engine, const char *sql,
     /* 검증 오류는 문장의 첫 토큰을 가리킵니다. 성공하면 쓰지 않습니다. */
     result->error_line = statement->line;
     result->error_byte_in_line = statement->byte_in_line;
-    if (engine_find_table(engine, statement->table, &table_index)) {
-        execute_locked(engine, table_index, statement, result);
+    if (cursor != NULL && statement->kind == STATEMENT_INSERT) {
+        result->kind = ENGINE_STATEMENT_INSERT;
+        result_fail(result, ENGINE_REASON_INVALID_CURSOR,
+                    "INSERT에는 커서를 붙이지 않습니다");
+    } else if (engine_find_table(engine, statement->table, &table_index)) {
+        execute_locked(engine, table_index, statement, cursor, result);
     } else {
         result_fail(result, ENGINE_REASON_NO_TABLE, "없는 테이블입니다: %s",
                     statement->table);
@@ -298,7 +331,7 @@ static int engine_init_table_locks(struct engine *engine, char *error,
    안에서 읽습니다. */
 static void execute_locked(const struct engine *engine, size_t table_index,
                            const struct statement *statement,
-                           struct engine_result *result)
+                           const uint64_t *cursor, struct engine_result *result)
 {
     struct table *table = engine->tables[table_index];
     struct rwlock *lock = &engine->table_locks[table_index];
@@ -317,7 +350,7 @@ static void execute_locked(const struct engine *engine, size_t table_index,
     } else if (writes) {
         execute_insert(table, statement, result);
     } else {
-        execute_select(table, &engine->options, statement, result);
+        execute_select(table, &engine->options, statement, cursor, result);
     }
     if (writes) {
         rwlock_write_unlock(lock);
@@ -426,10 +459,12 @@ insert_error_reason(enum table_insert_status insert_status)
     }
 }
 
+/* 결과 상한에 닿으면 거기서 멈추고 다음 record의 커서를 남깁니다. 읽기
+   잠금은 부르는 쪽이 이 부분을 읽는 동안만 쥡니다. */
 static void execute_select(struct table *table,
                            const struct engine_options *options,
                            const struct statement *statement,
-                           struct engine_result *result)
+                           const uint64_t *cursor, struct engine_result *result)
 {
     size_t result_bytes = 0;
     size_t source_count = statement->field_count == 0 ? table->field_count + 1
@@ -448,14 +483,7 @@ static void execute_select(struct table *table,
     if (result_set_fields(result, table, statement, sources) == 0 &&
         where_check(result, table, statement, &where_source) == 0) {
         result->access_path = select_plan(statement, where_source);
-        iterator =
-            result->access_path == ENGINE_ACCESS_PATH_INDEX
-                ? table_index_create(table, statement->where_value.integer)
-                : table_scan_create(table);
-        if (iterator == NULL) {
-            result_fail(result, ENGINE_REASON_OUT_OF_MEMORY,
-                        "메모리가 부족합니다");
-        }
+        iterator = select_iterator_create(table, statement, cursor, result);
     }
     if (iterator == NULL) {
         free(sources);
@@ -485,13 +513,8 @@ static void execute_select(struct table *table,
     }
     iterator->destroy(iterator);
     free(sources);
-    /* 상한을 넘으면 모으기를 멈추고, 모은 record를 해제해 큰 결과가 메모리에
-       남지 않게 합니다. */
     if (status == 1) {
-        result_records_clear(result);
-        result_fail(result, ENGINE_REASON_RESULT_TOO_LARGE,
-                    "결과가 상한(record %zu건, %zu바이트)을 넘습니다",
-                    options->max_records, options->max_bytes);
+        select_part_end(result, options, &record);
         return;
     }
     if (status != 0) {
@@ -499,6 +522,67 @@ static void execute_select(struct table *table,
                     "%s.tbl을 읽지 못했습니다", table->name);
         return;
     }
+    result->status = ENGINE_OK;
+}
+
+/* 접근 경로의 iterator를 만듭니다. 커서는 SCAN에만 붙습니다. 실패하면
+   result에 오류를 쓰고 NULL입니다. */
+static struct record_iterator *
+select_iterator_create(struct table *table, const struct statement *statement,
+                       const uint64_t *cursor, struct engine_result *result)
+{
+    struct record_iterator *iterator;
+
+    if (cursor != NULL && result->access_path == ENGINE_ACCESS_PATH_INDEX) {
+        /* INDEX 결과는 많아야 1건이라 나눌 일이 없습니다. */
+        result_fail(result, ENGINE_REASON_INVALID_CURSOR,
+                    "id = 정수 조건의 SELECT에는 커서를 붙이지 않습니다");
+        return NULL;
+    }
+    if (cursor != NULL && !cursor_is_valid(table, *cursor)) {
+        result_fail(result, ENGINE_REASON_INVALID_CURSOR,
+                    "커서 %llu는 record가 시작하는 위치가 아닙니다",
+                    (unsigned long long)*cursor);
+        return NULL;
+    }
+    iterator = result->access_path == ENGINE_ACCESS_PATH_INDEX
+                   ? table_index_create(table, statement->where_value.integer)
+                   : table_scan_create(table, cursor == NULL ? 0 : *cursor);
+    if (iterator == NULL) {
+        result_fail(result, ENGINE_REASON_OUT_OF_MEMORY, "메모리가 부족합니다");
+    }
+    return iterator;
+}
+
+/* 파일 끝은 읽을 record가 없는 올바른 커서입니다. 테이블 파일은 덧붙이기만
+   하므로, 앞서 돌려준 커서는 뒤의 INSERT가 있어도 계속 record 시작입니다. */
+static bool cursor_is_valid(struct table *table, uint64_t cursor)
+{
+    if (cursor > table->committed_size) {
+        return false;
+    }
+    return cursor == table->committed_size ||
+           table_record_starts_at(table, cursor);
+}
+
+/* 결과 상한에 닿아 멈춘 SELECT를 끝냅니다. 상한을 넘게 한 마지막 record는
+   이번 부분에서 빼고 그 위치를 커서로 남깁니다. 그 record 하나뿐이면 나눌 수
+   없으므로 result_too_large이고, 모은 record를 해제해 큰 결과가 메모리에
+   남지 않게 합니다. */
+static void select_part_end(struct engine_result *result,
+                            const struct engine_options *options,
+                            const struct record *record)
+{
+    if (result->record_count == 1) {
+        result_records_clear(result);
+        result_fail(result, ENGINE_REASON_RESULT_TOO_LARGE,
+                    "record 하나가 결과 상한(%zu바이트)보다 큽니다",
+                    options->max_bytes);
+        return;
+    }
+    result_last_record_drop(result);
+    result->has_next_cursor = true;
+    result->next_cursor = record->offset;
     result->status = ENGINE_OK;
 }
 
@@ -629,11 +713,19 @@ static int result_add_record(struct engine_result *result,
         realloc(result->values, (result->record_count + 1) * field_count *
                                     sizeof(*result->values));
     struct value *record_values;
+    uint64_t *offsets;
 
     if (values == NULL) {
         return -1;
     }
     result->values = values;
+    offsets = realloc(result->record_offsets,
+                      (result->record_count + 1) * sizeof(*offsets));
+    if (offsets == NULL) {
+        return -1;
+    }
+    result->record_offsets = offsets;
+    offsets[result->record_count] = record->offset;
     record_values = &values[result->record_count * field_count];
     memset(record_values, 0, field_count * sizeof(*record_values));
     result->record_count++;
@@ -691,5 +783,21 @@ static void result_records_clear(struct engine_result *result)
     }
     free(result->values);
     result->values = NULL;
+    free(result->record_offsets);
+    result->record_offsets = NULL;
     result->record_count = 0;
+}
+
+/* 마지막 record의 text를 해제하고 결과에서 뺍니다. 배열은 줄이지 않습니다. */
+static void result_last_record_drop(struct engine_result *result)
+{
+    struct value *values =
+        &result->values[(result->record_count - 1) * result->field_count];
+
+    for (size_t i = 0; i < result->field_count; i++) {
+        if (values[i].type == VALUE_TEXT) {
+            free((char *)values[i].text);
+        }
+    }
+    result->record_count--;
 }

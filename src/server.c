@@ -62,10 +62,17 @@ _Static_assert(HEADER_BYTES_MAX + BODY_BYTES_MAX < MG_MAX_RECV_SIZE,
 #define RESULT_RECORDS_MAX 10000
 #define RESULT_BYTES_MAX (16 * 1024 * 1024)
 #define RESPONSE_BYTES_MAX (32 * 1024 * 1024)
+/* SELECT JSON의 records 뒤에 붙는 꼬리(access_path, records_examined,
+   next_cursor와 닫는 괄호)가 넘지 않는 길이입니다. 정수 두 개가 20자리여도
+   100바이트 안쪽입니다. */
+#define JSON_TAIL_BYTES_MAX 128
+#define CURSOR_QUERY_PREFIX "cursor="
 
 #define QUERY_PATH "/query"
 #define JSON_HEADERS "Content-Type: application/json\r\n"
 #define REPLY_HEADERS_BYTES 160
+/* 응답의 상태 줄과 Content-Length 줄, 빈 줄이 넘지 않는 길이입니다. */
+#define REPLY_LINE_BYTES 128
 #define ERROR_JSON_BYTES 256
 #define HTTP_OK 200
 #define HTTP_BAD_REQUEST 400
@@ -99,6 +106,8 @@ struct request {
     struct request *next; /* 완료 대기열 안의 다음 요청 */
     unsigned long connection_id;
     char *sql;
+    bool has_cursor; /* 요청에 ?cursor=가 있었음 */
+    uint64_t cursor;
     int status;
     char *json;
 };
@@ -161,10 +170,13 @@ static void request_route(struct server *server,
                           struct client *client,
                           const struct mg_http_message *message,
                           enum body_length_status length_status);
+static bool cursor_parse(struct mg_str query, bool *has_cursor,
+                         uint64_t *cursor);
 static void request_submit(struct server *server,
                            struct mg_connection *connection,
                            struct client *client,
-                           const struct mg_http_message *message);
+                           const struct mg_http_message *message,
+                           bool has_cursor, uint64_t cursor);
 static void connection_refuse(struct mg_connection *connection, int status,
                               const char *reason, const char *message);
 static void error_reply(struct mg_connection *connection, int status,
@@ -183,6 +195,8 @@ static const char *error_reason_name(enum engine_error_reason reason);
 static char *result_json_create(const struct engine_result *result,
                                 bool *is_too_large);
 static bool json_result_write(FILE *out, const struct engine_result *result);
+static size_t json_record_size(const struct engine_result *result,
+                               size_t record_index);
 static void json_value_write(FILE *out, const struct value *value);
 static void json_string_write(FILE *out, const char *text, size_t text_len);
 
@@ -553,6 +567,9 @@ static void request_route(struct server *server,
                           const struct mg_http_message *message,
                           enum body_length_status length_status)
 {
+    bool has_cursor = false;
+    uint64_t cursor = 0;
+
     if (mg_strcmp(message->uri, mg_str(QUERY_PATH)) != 0) {
         error_reply(connection, HTTP_NOT_FOUND, "", "route_not_found",
                     "경로는 /query 하나입니다");
@@ -565,9 +582,41 @@ static void request_route(struct server *server,
     } else if (memchr(message->body.buf, '\0', message->body.len) != NULL) {
         error_reply(connection, HTTP_BAD_REQUEST, "", "invalid_sql_body",
                     "본문에 NUL 바이트가 있습니다");
+    } else if (!cursor_parse(message->query, &has_cursor, &cursor)) {
+        error_reply(connection, HTTP_BAD_REQUEST, "", "invalid_cursor",
+                    "질의 문자열은 cursor=<0 이상의 정수> 하나입니다");
     } else {
-        request_submit(server, connection, client, message);
+        request_submit(server, connection, client, message, has_cursor, cursor);
     }
+}
+
+/* 질의 문자열은 비어 있거나 cursor=<0 이상의 십진 정수> 하나입니다. 커서가
+   record 시작인지는 엔진이 테이블의 잠금 안에서 봅니다. 64비트를 넘는
+   수는 어떤 테이블 파일보다도 크므로 여기서 거절합니다. */
+static bool cursor_parse(struct mg_str query, bool *has_cursor,
+                         uint64_t *cursor)
+{
+    size_t prefix_len = strlen(CURSOR_QUERY_PREFIX);
+    uint64_t number = 0;
+
+    *has_cursor = query.len > 0;
+    if (query.len == 0) {
+        return true;
+    }
+    if (query.len <= prefix_len ||
+        memcmp(query.buf, CURSOR_QUERY_PREFIX, prefix_len) != 0) {
+        return false;
+    }
+    for (size_t i = prefix_len; i < query.len; i++) {
+        unsigned int digit = (unsigned int)(unsigned char)query.buf[i] - '0';
+
+        if (digit > 9 || number > (UINT64_MAX - digit) / 10) {
+            return false;
+        }
+        number = number * 10 + digit;
+    }
+    *cursor = number;
+    return true;
 }
 
 /* 본문의 SQL을 NUL로 끝나는 새 문자열로 복사해 작업 대기열에 넣습니다.
@@ -576,7 +625,8 @@ static void request_route(struct server *server,
 static void request_submit(struct server *server,
                            struct mg_connection *connection,
                            struct client *client,
-                           const struct mg_http_message *message)
+                           const struct mg_http_message *message,
+                           bool has_cursor, uint64_t cursor)
 {
     struct request *request = calloc(1, sizeof(*request));
 
@@ -591,6 +641,8 @@ static void request_submit(struct server *server,
     memcpy(request->sql, message->body.buf, message->body.len);
     request->sql[message->body.len] = '\0';
     request->connection_id = connection->id;
+    request->has_cursor = has_cursor;
+    request->cursor = cursor;
     if (!work_queue_submit(server->work_queue, request)) {
         request_destroy(request);
         error_reply(connection, HTTP_UNAVAILABLE, "", "queue_full",
@@ -640,6 +692,13 @@ static void reply_send(struct mg_connection *connection, int status,
     }
     snprintf(reply_headers, sizeof(reply_headers), "%s%s%s", JSON_HEADERS,
              headers, connection_header);
+    /* mg_http_reply는 본문을 한 바이트씩 송신 버퍼에 붙이고, 버퍼가 차면 조금
+       키운 새 버퍼로 통째로 복사합니다. 수십 MB의 JSON에서는 이 복사가 응답
+       시간을 분 단위로 늘리므로, 응답 전체가 들어갈 크기를 먼저 잡습니다.
+       잡지 못하면 Mongoose가 하던 대로 조금씩 키웁니다. */
+    mg_iobuf_resize(&connection->send, connection->send.len + REPLY_LINE_BYTES +
+                                           strlen(reply_headers) +
+                                           strlen(json) + 1);
     mg_http_reply(connection, status, reply_headers, "%s", json);
     if (client->closes_after_reply) {
         connection->is_draining = 1;
@@ -658,7 +717,9 @@ static void request_execute(void *job, void *context)
        깨울 연결 번호를 먼저 복사해 둡니다. */
     unsigned long connection_id = request->connection_id;
     struct engine_result *result =
-        engine_execute(server->engine, request->sql, NULL);
+        request->has_cursor
+            ? engine_execute_from(server->engine, request->sql, request->cursor)
+            : engine_execute(server->engine, request->sql, NULL);
     bool is_too_large = false;
 
     request->status = result_status_get(result);
@@ -764,6 +825,7 @@ static int result_status_get(const struct engine_result *result)
     case ENGINE_REASON_TEXT_TOO_LONG:
     case ENGINE_REASON_MULTIPLE_STATEMENTS:
     case ENGINE_REASON_RESULT_TOO_LARGE:
+    case ENGINE_REASON_INVALID_CURSOR:
         return HTTP_BAD_REQUEST;
     default:
         return HTTP_INTERNAL_ERROR;
@@ -800,6 +862,8 @@ static const char *error_reason_name(enum engine_error_reason reason)
         return "table_unavailable";
     case ENGINE_REASON_ID_EXHAUSTED:
         return "id_exhausted";
+    case ENGINE_REASON_INVALID_CURSOR:
+        return "invalid_cursor";
     default:
         return "storage_error";
     }
@@ -829,10 +893,15 @@ static char *result_json_create(const struct engine_result *result,
     return json;
 }
 
-/* JSON을 쓰다가 RESPONSE_BYTES_MAX를 넘으면 멈추고 false입니다. 엔진의 결과
-   상한 안이라도 이스케이프가 JSON을 키울 수 있으므로 record마다 봅니다. */
+/* 엔진의 결과 상한 안이라도 이스케이프가 JSON을 키울 수 있으므로, record를
+   쓰기 전마다 그 record의 JSON 길이를 재어 RESPONSE_BYTES_MAX를 넘을지
+   봅니다. 넘을 record부터는 쓰지 않고 그 record의 위치를 next_cursor로
+   보냅니다. 첫 record부터 넘으면 나눌 수 없으므로 false입니다. */
 static bool json_result_write(FILE *out, const struct engine_result *result)
 {
+    bool has_next_cursor = result->has_next_cursor;
+    uint64_t next_cursor = result->next_cursor;
+
     if (result->status == ENGINE_EMPTY) {
         fputs("{\"error\": \"no_statement\", \"message\": \"실행할 SQL 문장이 "
               "없습니다\"}",
@@ -855,6 +924,16 @@ static bool json_result_write(FILE *out, const struct engine_result *result)
         }
         fputs("], \"records\": [", out);
         for (size_t i = 0; i < result->record_count; i++) {
+            if ((size_t)ftell(out) + json_record_size(result, i) +
+                    JSON_TAIL_BYTES_MAX >
+                RESPONSE_BYTES_MAX) {
+                if (i == 0) {
+                    return false;
+                }
+                has_next_cursor = true;
+                next_cursor = result->record_offsets[i];
+                break;
+            }
             fputs(i == 0 ? "[" : ", [", out);
             for (size_t j = 0; j < result->field_count; j++) {
                 fputs(j == 0 ? "" : ", ", out);
@@ -862,17 +941,46 @@ static bool json_result_write(FILE *out, const struct engine_result *result)
                                  &result->values[i * result->field_count + j]);
             }
             fputc(']', out);
-            if (ftell(out) > RESPONSE_BYTES_MAX) {
-                return false;
-            }
         }
         fprintf(
-            out,
-            "], \"access_path\": \"%s\", \"records_examined\": %" PRIu64 "}",
+            out, "], \"access_path\": \"%s\", \"records_examined\": %" PRIu64,
             result->access_path == ENGINE_ACCESS_PATH_INDEX ? "INDEX" : "SCAN",
             result->records_examined);
+        if (has_next_cursor) {
+            fprintf(out, ", \"next_cursor\": %" PRIu64, next_cursor);
+        }
+        fputc('}', out);
     }
     return true;
+}
+
+/* json_result_write가 record 하나에 쓸 바이트 수입니다. 앞의 ", "와 대괄호를
+   포함합니다. 세는 규칙은 json_value_write, json_string_write와 같습니다. */
+static size_t json_record_size(const struct engine_result *result,
+                               size_t record_index)
+{
+    const struct value *values =
+        &result->values[record_index * result->field_count];
+    size_t size = record_index == 0 ? 2 : 4;
+
+    for (size_t j = 0; j < result->field_count; j++) {
+        size += j == 0 ? 0 : 2;
+        if (values[j].type == VALUE_INT) {
+            size += (size_t)snprintf(NULL, 0, "%" PRId64, values[j].integer);
+            continue;
+        }
+        size += 2;
+        for (size_t k = 0; k < values[j].text_len; k++) {
+            unsigned char byte = (unsigned char)values[j].text[k];
+
+            if (byte == '"' || byte == '\\') {
+                size += 2;
+            } else {
+                size += byte < 0x20 ? 6 : 1;
+            }
+        }
+    }
+    return size;
 }
 
 /* INT는 double을 거치지 않고 64비트 정수 그대로 씁니다. */

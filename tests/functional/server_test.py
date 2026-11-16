@@ -399,13 +399,94 @@ def body_shorter_than_declared_is_not_run():
         assert [record[1] for record in server.records()] == ["b"]
 
 
-def result_over_10000_records_is_400_result_too_large():
+def select_parts(server, sql):
+    """next_cursor가 없을 때까지 같은 SQL을 커서와 함께 다시 보내고, 부분마다 records를 모읍니다."""
+    parts = []
+    path = "/query"
+    while True:
+        status, _, body = server.request("POST", path, sql.encode("utf-8"))
+        assert status == 200, (status, body)
+        parts.append(body["records"])
+        if "next_cursor" not in body:
+            return parts
+        path = f"/query?cursor={body['next_cursor']}"
+
+
+def result_over_10000_records_comes_in_two_parts():
     records = [("n", "e", i) for i in range(1, 10001)] + [("last", "e", 10001)]
     with Server(records=records) as server:
-        status, body = server.query("SELECT * FROM users;")
-        assert (status, body["error"]) == (400, "result_too_large"), (status, body)
+        parts = select_parts(server, "SELECT id FROM users;")
+        assert [len(part) for part in parts] == [10000, 1], [len(part) for part in parts]
+        assert parts[1] == [[10001]], parts[1]
         status, body = server.query("SELECT id FROM users WHERE name = 'n';")
         assert status == 200 and len(body["records"]) == 10000, status
+        assert "next_cursor" not in body, body.keys()
+
+
+def joined_parts_equal_whole_result():
+    records = [(f"n{i}", f"e{i}", i % 2) for i in range(1, 25001)]
+    with Server(records=records) as server:
+        parts = select_parts(server, "SELECT * FROM users;")
+        assert [len(part) for part in parts] == [10000, 10000, 5000], [len(part) for part in parts]
+        expected = [[i, f"n{i}", f"e{i}", i % 2] for i in range(1, 25001)]
+        assert sum(parts, []) == expected
+        parts = select_parts(server, "SELECT id FROM users WHERE age = 1;")
+        assert [len(part) for part in parts] == [10000, 2500], [len(part) for part in parts]
+        assert sum(parts, []) == [[i] for i in range(1, 25001, 2)]
+
+
+def insert_between_parts_appears_only_in_later_part():
+    records = [("n", "e", i) for i in range(1, 10002)]
+    with Server(records=records) as server:
+        sql = "SELECT id, name FROM users WHERE name = 'n';"
+        status, _, first = server.request("POST", "/query", sql.encode())
+        assert status == 200 and len(first["records"]) == 10000, status
+        # 앞 부분의 읽기 잠금이 남아 있으면 이 INSERT가 REQUEST_TIMEOUT 안에 끝나지 않습니다.
+        assert server.query(insert("n"))[1] == {"inserted": 1, "id": 10002}
+        assert server.query(insert("x"))[1] == {"inserted": 1, "id": 10003}
+        status, _, second = server.request(
+            "POST", f"/query?cursor={first['next_cursor']}", sql.encode())
+        assert status == 200, second
+        assert second["records"] == [[10001, "n"], [10002, "n"]], second["records"]
+        assert "next_cursor" not in second
+
+
+def each_invalid_cursor_is_400_invalid_cursor():
+    records = [("n", "e", 1), ("m", "e", 2)]
+    file_size = len(users_record_bytes(1, *records[0])) + len(users_record_bytes(2, *records[1]))
+    cases = [
+        ("1", "SELECT * FROM users;"),
+        (str(file_size + 1), "SELECT * FROM users;"),
+        ("18446744073709551616", "SELECT * FROM users;"),
+        ("-1", "SELECT * FROM users;"),
+        ("abc", "SELECT * FROM users;"),
+        ("1.5", "SELECT * FROM users;"),
+        ("", "SELECT * FROM users;"),
+        ("0&x=1", "SELECT * FROM users;"),
+        ("0", "SELECT * FROM users WHERE id = 1;"),
+        ("0", insert("z")),
+    ]
+    with Server(records=records) as server:
+        for cursor, sql in cases:
+            status, _, body = server.request("POST", f"/query?cursor={cursor}", sql.encode())
+            assert (status, body["error"]) == (400, "invalid_cursor"), (cursor, sql, status, body)
+        status, _, body = server.request("POST", "/query?page=1", b"SELECT * FROM users;")
+        assert (status, body["error"]) == (400, "invalid_cursor"), body
+        status, _, body = server.request("POST", f"/query?cursor={file_size}", b"SELECT * FROM users;")
+        assert (status, body["records"]) == (200, []), body
+        assert [record[1] for record in server.records()] == ["n", "m"]
+
+
+def json_over_response_limit_is_cut_into_parts():
+    # 제어 문자는 JSON에서 \u0001 여섯 바이트가 됩니다. record 하나의 JSON이 약 6 MB이므로
+    # 값은 7 MB로 결과 상한(16 MiB) 안이지만 JSON은 응답 상한(32 MiB)을 넘습니다.
+    text = "\x01" * 1_000_000
+    records = [(text, "e", i) for i in range(1, 8)]
+    with Server(records=records) as server:
+        parts = select_parts(server, "SELECT id, name FROM users;")
+        assert len(parts) == 2, [len(part) for part in parts]
+        assert [record[0] for record in sum(parts, [])] == list(range(1, 8))
+        assert all(record[1] == text for record in sum(parts, []))
 
 
 def full_queue_is_503_queue_full_without_running_sql():
@@ -501,8 +582,20 @@ TESTS = [
      header_over_8_kib_is_refused_and_server_keeps_serving),
     ("[T205] 선언한 길이보다 본문을 덜 보내고 끊은 요청은 실행되지 않는다",
      body_shorter_than_declared_is_not_run),
-    ("[T206] 1만 1건을 돌려줄 SELECT는 400 result_too_large이고, 1만 건은 200이다",
-     result_over_10000_records_is_400_result_too_large),
+    ("[T206] 1만 1건을 돌려줄 SELECT는 1만 건과 next_cursor를 받고 두 번째 부분은 1건이며, "
+     "정확히 1만 건인 결과에는 next_cursor가 없다",
+     result_over_10000_records_comes_in_two_parts),
+    ("[T242] 부분 사이에 INSERT가 없으면 커서로 받은 부분들을 이은 결과가 SCAN 한 번의 결과와 같다",
+     joined_parts_equal_whole_result),
+    ("[T243] 부분 사이의 INSERT는 기다리지 않고 들어가고, 조건에 맞는 새 record는 뒤 부분에만 "
+     "나오며 앞서 받은 record는 다시 나오거나 빠지지 않는다",
+     insert_between_parts_appears_only_in_later_part),
+    ("[T244] record 시작이 아닌 위치, 파일 크기보다 큰 위치, 0 이상의 정수가 아닌 값, INDEX 질의와 "
+     "INSERT에 붙은 커서는 400 invalid_cursor이고, 파일 끝의 커서는 0건이다",
+     each_invalid_cursor_is_400_invalid_cursor),
+    ("[T245] JSON이 응답 상한을 넘을 결과는 상한 앞에서 next_cursor로 잘리고, 부분들을 이으면 "
+     "모든 record가 나온다",
+     json_over_response_limit_is_cut_into_parts),
     ("[T207] 작업 대기열이 가득 차면 SQL을 실행하지 않고 503 queue_full로 바로 답한다",
      full_queue_is_503_queue_full_without_running_sql),
     ("[T208] 한 연결에 요청 세 개를 연달아 보내면 보낸 순서대로 응답을 받고 연결을 다시 쓴다",

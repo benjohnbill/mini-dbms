@@ -205,7 +205,7 @@ enum table_insert_status table_insert(struct table *table,
     return TABLE_INSERT_OK;
 }
 
-struct record_iterator *table_scan_create(struct table *table)
+struct record_iterator *table_scan_create(struct table *table, uint64_t start)
 {
     struct table_scan *scan = calloc(1, sizeof(*scan));
 
@@ -220,8 +220,27 @@ struct record_iterator *table_scan_create(struct table *table)
     scan->iterator.next = scan_next;
     scan->iterator.destroy = scan_destroy;
     scan->table = table;
+    scan->offset = start;
 
     return &scan->iterator;
+}
+
+bool table_record_starts_at(struct table *table, uint64_t offset)
+{
+    struct record_iterator *iterator = table_scan_create(table, offset);
+    struct record record;
+    uint64_t tree_offset;
+    bool starts;
+
+    if (iterator == NULL) {
+        return false;
+    }
+    starts = iterator->next(iterator, &record) == 1 &&
+             bptree_find(table->tree, record.id, &tree_offset) &&
+             tree_offset == offset;
+    iterator->destroy(iterator);
+
+    return starts;
 }
 
 struct record_iterator *table_index_create(struct table *table,
@@ -612,10 +631,16 @@ static int scan_next(struct record_iterator *iterator, struct record *record)
     if (scan->offset >= scan->table->committed_size) {
         return 0;
     }
-    if (read_full(scan->table->fd, header, LENGTH_BYTES, scan->offset) != 0) {
+    /* 커서 검사는 record 시작이 아닐 수 있는 위치를 읽습니다. 그 자리의
+       길이 칸이 파일 끝을 넘으면 본문 버퍼를 할당하기 전에 멈춥니다. */
+    if (scan->table->committed_size - scan->offset < LENGTH_BYTES ||
+        read_full(scan->table->fd, header, LENGTH_BYTES, scan->offset) != 0) {
         return -1;
     }
     body_len = get_u32(header);
+    if (body_len > scan->table->committed_size - scan->offset - LENGTH_BYTES) {
+        return -1;
+    }
     if (body_len > scan->body_capacity) {
         char *body = realloc(scan->body, body_len);
 
@@ -630,6 +655,7 @@ static int scan_next(struct record_iterator *iterator, struct record *record)
         scan_decode_body(scan, body_len, record) != 0) {
         return -1;
     }
+    record->offset = scan->offset;
     scan->offset += LENGTH_BYTES + (uint64_t)body_len;
 
     return 1;

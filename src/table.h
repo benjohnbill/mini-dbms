@@ -49,10 +49,11 @@ enum table_insert_status {
 };
 
 /* values는 스키마 순서의 field 값이고, text는 다음 next 호출 전까지만 쓸 수
-   있습니다. */
+   있습니다. offset은 이 record가 테이블 파일에서 시작하는 위치입니다. */
 struct record {
     int64_t id;
     struct value *values;
+    uint64_t offset;
 };
 
 /* SCAN과 INDEX가 같은 모양으로 record를 내줍니다. 실행기는 둘을 구분하지
@@ -76,8 +77,13 @@ enum table_insert_status table_insert(struct table *table,
                                       int64_t *inserted_id, char *error,
                                       size_t error_size);
 
-/* committed_size까지 처음부터 읽는 SCAN iterator입니다. */
-struct record_iterator *table_scan_create(struct table *table);
+/* start부터 committed_size까지 읽는 SCAN iterator입니다. start는 record가
+   시작하는 위치여야 합니다. 처음부터 읽으려면 0을 넘깁니다. */
+struct record_iterator *table_scan_create(struct table *table, uint64_t start);
+
+/* offset에서 record 하나가 시작하면 참입니다. 그 위치의 record를 읽고, 그
+   id를 B+ 트리에서 찾아 같은 offset이 나오는지 봅니다. */
+bool table_record_starts_at(struct table *table, uint64_t offset);
 
 /* B+ 트리에서 target_id의 offset을 찾아 그 record 하나만 읽는 INDEX
    iterator입니다. target_id가 없으면 record를 읽지 않고 바로 끝납니다. */

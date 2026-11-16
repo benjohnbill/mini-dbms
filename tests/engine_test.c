@@ -18,6 +18,9 @@
 #define PATH_MAX_LEN 512
 
 #define DATA_DIR_MAX 64
+/* 잠금을 기다리면 멈추는 테스트를 실패로 바꾸는 시간입니다. 순서를 맞추는
+   데는 쓰지 않습니다. */
+#define HANG_LIMIT_SECONDS 20
 
 static char data_dir[DATA_DIR_MAX];
 
@@ -72,41 +75,149 @@ static struct engine_result *execute_one(struct engine *engine,
 static struct engine *limited_engine_create(size_t max_records,
                                             size_t max_bytes);
 
-static void select_over_record_limit_is_result_too_large_test(void)
+/* limited_engine_create의 users record 하나는 길이 4, id 8, 'kim' 4 + 3,
+   'k@x' 4 + 3, age 8로 34바이트입니다. record i(0부터)는 34 * i에서
+   시작하고, 네 건을 넣은 테이블 파일은 136바이트입니다. */
+#define LIMITED_RECORD_BYTES 34
+#define LIMITED_FILE_BYTES 136
+
+static void select_over_record_limit_returns_part_and_cursor_test(void)
 {
     struct engine *engine = limited_engine_create(3, 0);
     struct engine_result *result = execute_one(engine, "SELECT * FROM users;");
 
-    TEST_CHECK(result->status == ENGINE_ERROR);
-    TEST_CHECK(result->error_reason == ENGINE_REASON_RESULT_TOO_LARGE);
-    TEST_CHECK(result->record_count == 0);
-    TEST_CHECK(result->values == NULL);
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_CHECK(result->record_count == 3);
+    TEST_CHECK(result->has_next_cursor);
+    TEST_CHECK(result->next_cursor == 3 * LIMITED_RECORD_BYTES);
     engine_result_destroy(result);
 
+    result = engine_execute_from(engine, "SELECT * FROM users;",
+                                 3 * LIMITED_RECORD_BYTES);
+    TEST_ASSERT(result != NULL);
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_ASSERT(result->record_count == 1);
+    TEST_CHECK(result->values[0].integer == 4);
+    TEST_CHECK(!result->has_next_cursor);
+    engine_result_destroy(result);
+
+    /* 정확히 상한만큼인 결과에는 커서가 없습니다. */
     result = execute_one(engine, "SELECT name FROM users WHERE age = 1;");
     TEST_CHECK(result->status == ENGINE_OK);
     TEST_CHECK(result->record_count == 3);
+    TEST_CHECK(!result->has_next_cursor);
     engine_result_destroy(result);
 
     engine_destroy(engine);
     data_dir_remove();
 }
 
-static void select_over_byte_limit_is_result_too_large_test(void)
+static void select_over_byte_limit_returns_part_and_cursor_test(void)
 {
-    /* record 하나는 id 8, 'kim' 3, 'k@x' 3, age 8로 22바이트입니다. */
+    /* 결과 record 하나는 id 8, 'kim' 3, 'k@x' 3, age 8로 22바이트입니다. */
     struct engine *engine = limited_engine_create(0, 50);
     struct engine_result *result =
         execute_one(engine, "SELECT * FROM users WHERE age = 1;");
 
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_CHECK(result->record_count == 2);
+    TEST_CHECK(result->has_next_cursor);
+    TEST_CHECK(result->next_cursor == 2 * LIMITED_RECORD_BYTES);
+    engine_result_destroy(result);
+
+    result = engine_execute_from(engine, "SELECT * FROM users WHERE age = 1;",
+                                 2 * LIMITED_RECORD_BYTES);
+    TEST_ASSERT(result != NULL);
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_ASSERT(result->record_count == 1);
+    TEST_CHECK(result->values[0].integer == 3);
+    TEST_CHECK(!result->has_next_cursor);
+    engine_result_destroy(result);
+    engine_destroy(engine);
+    data_dir_remove();
+
+    /* record 하나가 상한보다 크면 나눌 수 없으므로 result_too_large입니다. */
+    engine = limited_engine_create(0, 10);
+    result = execute_one(engine, "SELECT * FROM users;");
     TEST_CHECK(result->status == ENGINE_ERROR);
     TEST_CHECK(result->error_reason == ENGINE_REASON_RESULT_TOO_LARGE);
     TEST_CHECK(result->record_count == 0);
+    TEST_CHECK(result->values == NULL);
+    engine_result_destroy(result);
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
+static void check_invalid_cursor(struct engine *engine, const char *sql,
+                                 uint64_t cursor);
+
+static void invalid_cursor_is_rejected_test(void)
+{
+    struct engine *engine = limited_engine_create(3, 0);
+    struct engine_result *result;
+
+    check_invalid_cursor(engine, "SELECT * FROM users;", 1);
+    check_invalid_cursor(engine, "SELECT * FROM users;",
+                         LIMITED_RECORD_BYTES + 4);
+    check_invalid_cursor(engine, "SELECT * FROM users;",
+                         LIMITED_FILE_BYTES + 1);
+    check_invalid_cursor(engine, "SELECT * FROM users;", UINT64_MAX);
+    check_invalid_cursor(engine, "SELECT * FROM users WHERE id = 1;", 0);
+    check_invalid_cursor(engine, "INSERT INTO users VALUES ('a', 'b', 1);", 0);
+
+    /* 파일 끝은 읽을 record가 없는 올바른 커서입니다. */
+    result =
+        engine_execute_from(engine, "SELECT * FROM users;", LIMITED_FILE_BYTES);
+    TEST_ASSERT(result != NULL);
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_CHECK(result->record_count == 0);
+    TEST_CHECK(!result->has_next_cursor);
     engine_result_destroy(result);
 
-    result = execute_one(engine, "SELECT * FROM users WHERE age = 2;");
+    /* 거절한 INSERT는 파일에 쓰지 않았습니다. */
+    result = engine_execute_from(engine, "SELECT * FROM users;", 0);
+    TEST_ASSERT(result != NULL);
     TEST_CHECK(result->status == ENGINE_OK);
+    TEST_CHECK(result->record_count == 3);
+    TEST_CHECK(result->next_cursor == 3 * LIMITED_RECORD_BYTES);
+    engine_result_destroy(result);
+    result = engine_execute_from(engine, "SELECT * FROM users;",
+                                 3 * LIMITED_RECORD_BYTES);
+    TEST_ASSERT(result != NULL);
     TEST_CHECK(result->record_count == 1);
+    engine_result_destroy(result);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
+static void insert_between_parts_does_not_wait_test(void)
+{
+    struct engine *engine = limited_engine_create(3, 0);
+    struct engine_result *result = execute_one(engine, "SELECT * FROM users;");
+    uint64_t cursor = result->next_cursor;
+
+    TEST_CHECK(result->has_next_cursor);
+    engine_result_destroy(result);
+
+    /* 앞 부분의 읽기 잠금이 남아 있으면 같은 스레드의 쓰기 잠금이 영원히
+       기다리고, alarm이 테스트를 실패로 끝냅니다. */
+    alarm(HANG_LIMIT_SECONDS);
+    result = execute_one(engine, "INSERT INTO users VALUES ('new', 'n@x', 1);");
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_CHECK(result->inserted_id == 5);
+    engine_result_destroy(result);
+    alarm(0);
+
+    /* 새 record는 뒤 부분에만 나오고, 앞 부분의 record는 다시 나오지
+       않습니다. */
+    result = engine_execute_from(engine, "SELECT id FROM users;", cursor);
+    TEST_ASSERT(result != NULL);
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_ASSERT(result->record_count == 2);
+    TEST_CHECK(result->values[0].integer == 4);
+    TEST_CHECK(result->values[1].integer == 5);
+    TEST_CHECK(!result->has_next_cursor);
     engine_result_destroy(result);
 
     engine_destroy(engine);
@@ -995,9 +1106,6 @@ static void select_reports_scan_and_records_examined_test(void)
 #define MIXED_READERS 4
 #define SQL_MAX_LEN 128
 #define MARK_MAX_LEN 32
-/* 다른 테이블을 기다리면 이 테스트는 멈춥니다. 멈춘 테스트를 실패로 바꾸는
-   시간이며, 순서를 맞추는 데는 쓰지 않습니다. */
-#define HANG_LIMIT_SECONDS 20
 
 /* 모든 스레드가 만들어진 뒤에 함께 출발시킵니다. pthread_barrier는 macOS에
    없어 mutex와 조건 변수로 만듭니다. */
@@ -1839,12 +1947,19 @@ TEST_LIST = {
     {"[T160] API 모드에서 문장 뒤에 다른 문장이 있으면 multiple_statements "
      "오류이고 첫 문장도 실행하지 않는다",
      api_mode_rejects_second_statement_before_running_test},
-    {"[T200] 결과 상한이 record 3건인 엔진에서 4건을 돌려줄 SELECT는 "
-     "result_too_large이고 모은 record를 남기지 않으며, 3건은 돌려준다",
-     select_over_record_limit_is_result_too_large_test},
-    {"[T201] 결과 상한이 50바이트인 엔진에서 22바이트 record 세 건은 "
-     "result_too_large이고 한 건은 돌려준다",
-     select_over_byte_limit_is_result_too_large_test},
+    {"[T200] 결과 상한이 record 3건인 엔진에서 4건을 돌려줄 SELECT는 3건과 "
+     "넷째 record의 위치인 next_cursor를 받고, 그 커서로 다시 부르면 남은 "
+     "1건과 커서 없음을 받으며, 정확히 3건인 결과에는 커서가 없다",
+     select_over_record_limit_returns_part_and_cursor_test},
+    {"[T201] 결과 상한이 50바이트인 엔진에서 22바이트 record 세 건은 두 건과 "
+     "next_cursor로 나뉘고, record 하나가 상한보다 크면 result_too_large이다",
+     select_over_byte_limit_returns_part_and_cursor_test},
+    {"[T240] record 시작이 아닌 위치, 파일 크기보다 큰 위치, INDEX 질의와 "
+     "INSERT에 붙은 커서는 invalid_cursor이고, 파일 끝의 커서는 0건이다",
+     invalid_cursor_is_rejected_test},
+    {"[T241] 앞 부분을 받은 뒤의 INSERT는 기다리지 않고 들어가고, 새 record는 "
+     "뒤 부분에만 나온다",
+     insert_between_parts_does_not_wait_test},
     {NULL, NULL},
 };
 
@@ -1935,6 +2050,19 @@ static struct engine_result *execute_one(struct engine *engine, const char *sql)
 
     TEST_ASSERT(result != NULL);
     return result;
+}
+
+static void check_invalid_cursor(struct engine *engine, const char *sql,
+                                 uint64_t cursor)
+{
+    struct engine_result *result = engine_execute_from(engine, sql, cursor);
+
+    TEST_ASSERT(result != NULL);
+    TEST_CHECK(result->status == ENGINE_ERROR);
+    TEST_CHECK(result->error_reason == ENGINE_REASON_INVALID_CURSOR);
+    TEST_MSG("sql: %s, cursor: %llu", sql, (unsigned long long)cursor);
+    TEST_CHECK(result->record_count == 0);
+    engine_result_destroy(result);
 }
 
 static void check_text(const struct value *value, const char *expected)
