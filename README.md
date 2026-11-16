@@ -146,6 +146,8 @@ Phase 2의 ID 기준 SELECT(인덱스 사용)와 다른 필드 기준 SELECT(선
 티켓마다 그 티켓이 만드는 한계를 한 줄씩 더합니다(티켓 01, 02, 04, 10, 12, 13). 전체 목록은 `docs/prd/final.md` § Further Notes에 있고, 일부러 하지 않는 기능은 같은 문서의 Out of Scope에 있습니다.
 
 - `fsync`를 하지 않아 정전 때 성공을 알린 record를 잃을 수 있습니다(`docs/prd/final.md` § 공통, 영속성).
+- 길이 칸은 맞고 `TEXT` 바이트만 바뀐 손상은 찾지 못합니다. 체크섬(CRC)이 없기 때문입니다([`docs/prd/issues/04-detect-damaged-table-file.md`](docs/prd/issues/04-detect-damaged-table-file.md)).
+- 깨진 테이블 파일은 사람이 고쳐야 다시 시작합니다. 엔진은 `잘림`이나 `손상`을 찾으면 파일 이름, 바이트 위치, record 번호를 알리고 멈출 뿐, 파일을 고치지 않습니다.
 
 ## 파일 트리
 

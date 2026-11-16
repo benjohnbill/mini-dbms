@@ -201,6 +201,28 @@ def dump_of_unknown_table_exits_1():
         shutil.rmtree(data_dir)
 
 
+def truncated_table_file_exits_1_and_keeps_file():
+    data_dir = make_data_dir()
+    try:
+        proc = run_sql(data_dir, "INSERT INTO users VALUES ('kim', 'k@x', 20);\n")
+        assert proc.returncode == 0, proc.stderr
+        table_path = os.path.join(data_dir, "users.tbl")
+        with open(table_path, "ab") as f:
+            f.write(b"\x20\x00")
+        with open(table_path, "rb") as f:
+            before = f.read()
+        proc = run_sql(data_dir, "SELECT * FROM users;")
+        assert proc.returncode == 1, proc.returncode
+        message = proc.stderr.decode("utf-8")
+        # 첫 record는 길이 칸 4 + id 8 + "kim" 4 + 3 + "k@x" 4 + 3 + age 8 = 34바이트입니다.
+        for expected in ("users.tbl", "34번째 바이트", "record(2번째)", "잘림"):
+            assert expected in message, message
+        with open(table_path, "rb") as f:
+            assert f.read() == before
+    finally:
+        shutil.rmtree(data_dir)
+
+
 TESTS = [
     ("[T1] 빈 데이터 폴더에서 INSERT 두 개와 SELECT *는 ID 1, 2인 record를 TSV로 출력한다",
      insert_two_and_select_prints_ids_1_and_2),
@@ -221,6 +243,9 @@ TESTS = [
     ("dump는 같은 테이블의 SELECT *와 같은 TSV를 출력한다",
      dump_prints_same_tsv_as_select_star),
     ("없는 테이블의 dump는 종료 코드 1로 끝난다", dump_of_unknown_table_exits_1),
+    ("[T66] 잘린 테이블 파일이면 CLI는 파일 이름, 바이트 위치, record 번호, 잘림을 "
+     "알리고 종료 코드 1로 끝나며 파일을 고치지 않는다",
+     truncated_table_file_exits_1_and_keeps_file),
 ]
 
 
