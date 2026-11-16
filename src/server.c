@@ -274,7 +274,7 @@ int main(int argc, char *argv[])
 /* 옵션마다 값 하나를 받습니다. 위치 인자는 없습니다. */
 static int args_parse(int argc, char *argv[], struct server_args *args)
 {
-    for (int i = 1; i < argc; i++) {
+    for (int i = 1; i < argc; i += 2) {
         const char *option = argv[i];
         const char *value = i + 1 < argc ? argv[i + 1] : NULL;
         bool valid = value != NULL;
@@ -306,7 +306,6 @@ static int args_parse(int argc, char *argv[], struct server_args *args)
         if (!valid) {
             return -1;
         }
-        i++;
     }
 
     return 0;
