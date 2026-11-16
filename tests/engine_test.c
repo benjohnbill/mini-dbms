@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "acutest.h"
+#include "bptree.h"
 #include "engine.h"
 #include "table.h"
 
@@ -1033,6 +1034,106 @@ static void where_id_with_text_is_type_error_without_reading_test(void)
     data_dir_remove();
 }
 
+static void inserted_id_is_found_through_index_test(void)
+{
+    struct engine *engine = users_engine_create();
+    struct engine_result *result;
+
+    users_insert(engine, 3);
+    result =
+        execute_one(engine, "INSERT INTO users VALUES ('new', 'n@x', 40);");
+    TEST_CHECK(result->inserted_id == 4);
+    engine_result_destroy(result);
+    check_index_record(execute_one(engine, "SELECT * FROM users WHERE id = 4;"),
+                       4, "new", "n@x", 40);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
+static void restart_rebuilds_index_from_table_file_test(void)
+{
+    struct engine *engine = users_engine_create();
+
+    users_insert(engine, 100);
+    engine_destroy(engine);
+
+    engine = engine_reopen();
+    check_index_record(execute_one(engine, "SELECT * FROM users WHERE id = 1;"),
+                       1, "user1", "u1@x", 1);
+    check_index_record(
+        execute_one(engine, "SELECT * FROM users WHERE id = 57;"), 57, "user57",
+        "u57@x", 57);
+    check_index_record(
+        execute_one(engine, "SELECT * FROM users WHERE id = 100;"), 100,
+        "user100", "u100@x", 100);
+    users_insert(engine, 1);
+    check_index_record(
+        execute_one(engine, "SELECT * FROM users WHERE id = 101;"), 101,
+        "user1", "u1@x", 1);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
+/* 빈 테이블의 트리는 노드를 미리 할당해 두지 않았으므로 첫 INSERT의 미리
+   할당이 실제로 노드를 할당합니다. */
+static void failed_tree_reserve_keeps_file_and_tree_test(void)
+{
+    struct engine *engine = users_engine_create();
+    struct engine_result *result;
+
+    bptree_allocate = failing_malloc;
+    result =
+        execute_one(engine, "INSERT INTO users VALUES ('kim', 'k@x', 20);");
+    bptree_allocate = malloc;
+    TEST_CHECK(result->status == ENGINE_ERROR);
+    TEST_CHECK(result->error_reason == ENGINE_REASON_OUT_OF_MEMORY);
+    engine_result_destroy(result);
+    TEST_CHECK(file_size_get("users.tbl") == 0);
+
+    result = execute_one(engine, "SELECT * FROM users WHERE id = 1;");
+    TEST_CHECK(result->access_path == ENGINE_ACCESS_PATH_INDEX);
+    TEST_CHECK(result->record_count == 0);
+    TEST_CHECK(result->records_examined == 0);
+    engine_result_destroy(result);
+    result =
+        execute_one(engine, "INSERT INTO users VALUES ('lee', 'l@x', 31);");
+    TEST_CHECK(result->inserted_id == 1);
+    engine_result_destroy(result);
+    check_index_record(execute_one(engine, "SELECT * FROM users WHERE id = 1;"),
+                       1, "lee", "l@x", 31);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
+/* 강제 SCAN은 티켓 08이 만듭니다. 여기서는 값이 record마다 다른 email로
+   같은 record를 SCAN해 견줍니다. */
+static void index_and_scan_return_same_record_test(void)
+{
+    struct engine *engine = users_engine_create();
+    struct engine_result *index_result;
+    struct engine_result *scan_result;
+
+    users_insert(engine, 50);
+    index_result = execute_one(engine, "SELECT * FROM users WHERE id = 33;");
+    scan_result =
+        execute_one(engine, "SELECT * FROM users WHERE email = 'u33@x';");
+    TEST_CHECK(scan_result->access_path == ENGINE_ACCESS_PATH_SCAN);
+    TEST_CHECK(scan_result->records_examined == 50);
+    TEST_ASSERT(scan_result->record_count == 1);
+    TEST_CHECK(scan_result->values[0].integer == 33);
+    check_text(&scan_result->values[1], "user33");
+    check_text(&scan_result->values[2], "u33@x");
+    TEST_CHECK(scan_result->values[3].integer == 33);
+    engine_result_destroy(scan_result);
+    check_index_record(index_result, 33, "user33", "u33@x", 33);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
 TEST_LIST = {
     {"[T6] INSERT는 ID 1을 받고 SELECT *가 그 record를 돌려준다",
      insert_returns_id_and_select_returns_record_test},
@@ -1126,6 +1227,16 @@ TEST_LIST = {
      where_other_field_scans_all_records_test},
     {"[T103] WHERE id = 'abc'는 타입 오류이고 record를 읽지 않는다",
      where_id_with_text_is_type_error_without_reading_test},
+    {"[T104] INSERT 직후의 WHERE id = 새 ID가 INDEX로 그 record를 찾는다",
+     inserted_id_is_found_through_index_test},
+    {"[T105] 엔진을 다시 만들면 테이블 파일에서 트리를 다시 만들어 WHERE id "
+     "= k가 INDEX로 같은 record를 찾는다",
+     restart_rebuilds_index_from_table_file_test},
+    {"[T106] 트리 미리 할당이 실패하면 INSERT는 out_of_memory이고 테이블 "
+     "파일과 트리가 그대로다",
+     failed_tree_reserve_keeps_file_and_tree_test},
+    {"[T107] 같은 record를 찾는 INDEX 결과와 SCAN 결과가 같다",
+     index_and_scan_return_same_record_test},
     {NULL, NULL},
 };
 
