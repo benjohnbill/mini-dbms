@@ -415,6 +415,8 @@ insert_error_reason(enum table_insert_status insert_status)
         return ENGINE_REASON_STORAGE_ERROR;
     case TABLE_INSERT_UNAVAILABLE:
         return ENGINE_REASON_TABLE_UNAVAILABLE;
+    case TABLE_INSERT_ID_EXHAUSTED:
+        return ENGINE_REASON_ID_EXHAUSTED;
     default:
         return ENGINE_REASON_NONE;
     }

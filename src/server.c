@@ -771,7 +771,8 @@ static int result_status_get(const struct engine_result *result)
 }
 
 /* 응답의 error 값입니다. 클라이언트가 읽는 고정된 영어 문자열입니다.
-   이유가 없는 엔진 오류(ID 소진)는 서버 쪽 실패로 storage_error입니다. */
+   ID 소진은 요청이 아니라 테이블의 상태 때문이므로 500입니다
+   (result_status_get의 default). */
 static const char *error_reason_name(enum engine_error_reason reason)
 {
     switch (reason) {
@@ -797,6 +798,8 @@ static const char *error_reason_name(enum engine_error_reason reason)
         return "out_of_memory";
     case ENGINE_REASON_TABLE_UNAVAILABLE:
         return "table_unavailable";
+    case ENGINE_REASON_ID_EXHAUSTED:
+        return "id_exhausted";
     default:
         return "storage_error";
     }

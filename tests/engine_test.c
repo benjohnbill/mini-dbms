@@ -399,6 +399,7 @@ static void insert_after_max_id_fails_and_keeps_file_test(void)
 
     result = execute_one(engine, "INSERT INTO ages VALUES (9);");
     TEST_CHECK(result->status == ENGINE_ERROR);
+    TEST_CHECK(result->error_reason == ENGINE_REASON_ID_EXHAUSTED);
     TEST_CHECK(strstr(result->error_message, "id") != NULL);
     TEST_MSG("error: %s", result->error_message);
     engine_result_destroy(result);

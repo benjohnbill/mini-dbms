@@ -208,6 +208,7 @@ HTTP/1.1 연결은 다시 씁니다. 한 연결에 요청을 여러 개 이어 �
 | `413` | `body_too_large` | 헤더를 정상으로 읽었고 선언한 본문 길이가 1 MiB를 넘음. 연결을 닫습니다 |
 | `431` | `header_too_large` | 헤더가 8 KiB를 넘음. 연결을 닫습니다 |
 | `500` | `storage_error`, `table_unavailable`, `out_of_memory` | 테이블 파일 쓰기나 읽기 실패, 되돌리기도 실패해 멈춘 테이블, 메모리 부족 |
+| `500` | `id_exhausted` | 테이블의 ID가 `INT` 최댓값(`2^63 − 1`)에 닿아 INSERT가 새 ID를 받을 수 없음 |
 | `503` | `queue_full` | 작업 대기열이 가득 참. 기다리지 않고 바로 답합니다 |
 
 ## 구조

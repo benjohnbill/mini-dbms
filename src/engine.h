@@ -43,6 +43,7 @@ enum engine_error_reason {
     ENGINE_REASON_TABLE_UNAVAILABLE,
     ENGINE_REASON_MULTIPLE_STATEMENTS, /* API 모드에서 문장 뒤에 다른 글자 */
     ENGINE_REASON_RESULT_TOO_LARGE,    /* SELECT 결과가 결과 상한을 넘음 */
+    ENGINE_REASON_ID_EXHAUSTED,        /* 테이블의 ID가 INT 최댓값에 닿음 */
 };
 
 enum engine_statement_kind {
