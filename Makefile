@@ -69,7 +69,7 @@ TSAN_LIB_OBJS := $(LIB_SRCS:src/%.c=$(TSAN_BUILD)/%.o)
 # 잠금과 작업 대기열의 단위 테스트와, 여러 스레드가 엔진을 함께 부르는 엔진 테스트입니다.
 TSAN_TESTS  := $(TSAN_BUILD)/rwlock_test $(TSAN_BUILD)/engine_test \
                $(TSAN_BUILD)/work_queue_test
-TSAN_ENGINE_TESTS := T123 T124 T125
+TSAN_ENGINE_TESTS := T123 T124 T125 T126
 
 # Acutest는 테스트마다 자식 프로세스를 만들고 그 종료 코드를 결과로 읽습니다. TSan의
 # 기본 종료 코드 66은 Acutest가 실패로 세지 않으므로, 경고가 실패(1)로 읽히게 바꿉니다.
