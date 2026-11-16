@@ -429,6 +429,72 @@ static void length_cut_in_last_record_is_truncation_test(void)
     }
 }
 
+static void body_cut_in_last_record_is_truncation_test(void)
+{
+    /* 둘째 record의 본문을 0바이트, id 중간, 길이 칸 중간, TEXT 중간에서
+       자릅니다. */
+    const size_t body_cuts[] = {0, 5, 10, 13};
+    unsigned char bytes[64];
+    size_t size = text_record_put(bytes, 15, 1, 3, "abc");
+
+    text_record_put(bytes + size, 15, 2, 3, "xyz");
+    for (size_t i = 0; i < sizeof(body_cuts) / sizeof(body_cuts[0]); i++) {
+        broken_table_check(bytes, size + 4 + body_cuts[i], "19번째 바이트",
+                           "record(2번째)", "잘림");
+    }
+}
+
+static void middle_length_past_file_end_is_corruption_test(void)
+{
+    unsigned char bytes[64];
+    size_t size = text_record_put(bytes, 115, 1, 3, "abc");
+
+    size += text_record_put(bytes + size, 15, 2, 3, "xyz");
+    broken_table_check(bytes, size, "0번째 바이트", "record(1번째)", "손상");
+}
+
+static void zero_length_record_is_corruption_test(void)
+{
+    unsigned char bytes[64] = {0};
+    size_t size = text_record_put(bytes, 15, 1, 3, "abc");
+
+    broken_table_check(bytes, size + 20, "19번째 바이트", "record(2번째)",
+                       "손상");
+}
+
+static void fields_not_matching_body_len_is_corruption_test(void)
+{
+    unsigned char bytes[64];
+    size_t size;
+
+    /* TEXT 길이 2: field가 본문 15바이트 중 14바이트만 씁니다. */
+    size = text_record_put(bytes, 15, 1, 2, "abc");
+    size += text_record_put(bytes + size, 15, 2, 3, "xyz");
+    broken_table_check(bytes, size, "0번째 바이트", "record(1번째)", "손상");
+
+    /* TEXT 길이 4: field가 본문 15바이트보다 1바이트 더 씁니다. */
+    size = text_record_put(bytes, 15, 1, 4, "abc");
+    size += text_record_put(bytes + size, 15, 2, 3, "xyz");
+    broken_table_check(bytes, size, "0번째 바이트", "record(1번째)", "손상");
+}
+
+static void id_not_above_previous_is_corruption_test(void)
+{
+    const int64_t second_ids[] = {1, 0, -3};
+    unsigned char bytes[64];
+    size_t size;
+
+    for (size_t i = 0; i < sizeof(second_ids) / sizeof(second_ids[0]); i++) {
+        size = text_record_put(bytes, 15, 1, 3, "abc");
+        size += text_record_put(bytes + size, 15, second_ids[i], 3, "xyz");
+        broken_table_check(bytes, size, "19번째 바이트", "record(2번째)",
+                           "손상");
+    }
+    /* 첫 id는 1 이상이어야 합니다. */
+    size = text_record_put(bytes, 15, 0, 3, "abc");
+    broken_table_check(bytes, size, "0번째 바이트", "record(1번째)", "손상");
+}
+
 TEST_LIST = {
     {"[T6] INSERT는 ID 1을 받고 SELECT *가 그 record를 돌려준다",
      insert_returns_id_and_select_returns_record_test},
@@ -460,6 +526,18 @@ TEST_LIST = {
     {"[T60] 마지막 길이 칸 중간(1~3바이트)에서 끝난 테이블 파일은 잘림으로 "
      "엔진 만들기를 멈추고 파일을 고치지 않는다",
      length_cut_in_last_record_is_truncation_test},
+    {"[T61] 마지막 record의 본문 중간에서 끝난 테이블 파일은 잘림으로 엔진 "
+     "만들기를 멈춘다",
+     body_cut_in_last_record_is_truncation_test},
+    {"[T62] 길이 칸이 파일 끝을 넘지만 field는 다 읽히는 중간 record는 잘림이 "
+     "아니라 손상이다",
+     middle_length_past_file_end_is_corruption_test},
+    {"[T63] 길이가 0인 record(0으로 채워진 끝)는 손상이다",
+     zero_length_record_is_corruption_test},
+    {"[T64] field가 본문 길이보다 적게 또는 많게 쓰는 record는 손상이다",
+     fields_not_matching_body_len_is_corruption_test},
+    {"[T65] 앞 record의 id보다 작거나 같은 id와 1보다 작은 첫 id는 손상이다",
+     id_not_above_previous_is_corruption_test},
     {NULL, NULL},
 };
 
