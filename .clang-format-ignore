@@ -1,0 +1,4 @@
+# Code we did not write. It keeps its own style, and `make lint` skips its
+# names too (scripts/convention.py reads this file).
+# acutest.h: https://github.com/mity/acutest, vendored as is.
+tests/acutest.h
