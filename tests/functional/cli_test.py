@@ -5,6 +5,7 @@
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -138,6 +139,109 @@ def sql_error_exits_1():
         shutil.rmtree(data_dir)
 
 
+def quote_and_semicolon_in_text_are_stored_as_written():
+    data_dir = make_data_dir()
+    try:
+        proc = run_sql(data_dir,
+                       "INSERT INTO users VALUES ('O''Brien', 'a;b', 1);\n"
+                       "SELECT name, email FROM users;\n")
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == b"name\temail\nO'Brien\ta;b\n", proc.stdout
+    finally:
+        shutil.rmtree(data_dir)
+
+
+def syntax_error_names_line_in_file():
+    cases = [
+        ("SELECT * FROM users;\n\nSELECT * FROM users", "3번째 줄"),
+        ("SELECT * FROM users;\nINSERT INTO users VALUES (\n'kim', 'oops, 1);\n",
+         "3번째 줄"),
+        ("SELECT * FROM users;\n\n-- 주석\nSELECT * FROM users;\n", "3번째 줄"),
+    ]
+    data_dir = make_data_dir()
+    try:
+        for sql, line in cases:
+            proc = run_sql(data_dir, sql)
+            stderr = proc.stderr.decode("utf-8")
+            assert proc.returncode == 1, (sql, proc.returncode)
+            assert line in stderr, (sql, stderr)
+    finally:
+        shutil.rmtree(data_dir)
+
+
+def error_keeps_earlier_inserts_and_skips_later_statements():
+    data_dir = make_data_dir()
+    try:
+        proc = run_sql(data_dir,
+                       "INSERT INTO users VALUES ('kim', 'k@x', 20);\n"
+                       "INSERT INTO users VALUES ('lee', 'l@x', 31);\n"
+                       "INSERT INTO users VALUES ('bad');\n"
+                       "INSERT INTO users VALUES ('park', 'p@x', 40);\n")
+        assert proc.returncode == 1, proc.returncode
+        assert "3번째 줄" in proc.stderr.decode("utf-8"), proc.stderr
+        proc = run_sql(data_dir, "SELECT name FROM users;")
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == b"name\nkim\nlee\n", proc.stdout
+    finally:
+        shutil.rmtree(data_dir)
+
+
+def nul_byte_in_sql_file_exits_1():
+    data_dir = make_data_dir()
+    try:
+        sql_path = os.path.join(data_dir, "input.sql")
+        with open(sql_path, "wb") as f:
+            f.write(b"SELECT * FROM users;\0\nINSERT INTO users VALUES ('a', 'b', 1);\n")
+        proc = run_cli(["--data", data_dir, sql_path])
+        assert proc.returncode == 1, proc.returncode
+        assert proc.stderr
+        assert proc.stdout == b"", proc.stdout
+        assert os.path.getsize(os.path.join(data_dir, "users.tbl")) == 0
+    finally:
+        shutil.rmtree(data_dir)
+
+
+META_INSERT = re.compile(r"^-- 1 record inserted, id [0-9]+$")
+META_SELECT = re.compile(r"^-- [0-9]+ records?, SCAN, examined [0-9]+, [0-9]+\.[0-9]{2} ms$")
+
+
+def meta_lines_go_to_stderr_one_per_statement():
+    data_dir = make_data_dir()
+    try:
+        proc = run_sql(data_dir,
+                       "INSERT INTO users VALUES ('kim', 'k@x', 20);\n"
+                       "INSERT INTO users VALUES ('lee', 'l@x', 31);\n"
+                       "SELECT * FROM users WHERE id = 2;\n"
+                       "SELECT * FROM users;\n")
+        assert proc.returncode == 0, proc.stderr
+        lines = proc.stderr.decode("utf-8").splitlines()
+        assert len(lines) == 4, lines
+        assert lines[0] == "-- 1 record inserted, id 1", lines
+        assert lines[1] == "-- 1 record inserted, id 2", lines
+        assert META_SELECT.match(lines[2]), lines
+        assert lines[2].startswith("-- 1 record, SCAN, examined 2, "), lines
+        assert lines[3].startswith("-- 2 records, SCAN, examined 2, "), lines
+    finally:
+        shutil.rmtree(data_dir)
+
+
+def quiet_option_hides_insert_meta_lines_only():
+    data_dir = make_data_dir()
+    try:
+        sql_path = os.path.join(data_dir, "input.sql")
+        with open(sql_path, "w", encoding="utf-8") as f:
+            f.write("INSERT INTO users VALUES ('kim', 'k@x', 20);\n"
+                    "SELECT name FROM users;\n")
+        proc = run_cli(["--data", data_dir, "-q", sql_path])
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == b"name\nkim\n", proc.stdout
+        lines = proc.stderr.decode("utf-8").splitlines()
+        assert not any(META_INSERT.match(line) for line in lines), lines
+        assert len(lines) == 1 and META_SELECT.match(lines[0]), lines
+    finally:
+        shutil.rmtree(data_dir)
+
+
 TESTS = [
     ("[T1] 빈 데이터 폴더에서 INSERT 두 개와 SELECT *는 ID 1, 2인 record를 TSV로 출력한다",
      insert_two_and_select_prints_ids_1_and_2),
@@ -151,6 +255,18 @@ TESTS = [
     ("[T4] 잘못된 CLI 인자는 종료 코드 2로 끝난다", bad_cli_arguments_exit_2),
     ("[T5] 열 수 없는 SQL 파일은 종료 코드 1로 끝난다", unreadable_sql_file_exits_1),
     ("SQL 실행 오류는 종료 코드 1로 끝난다", sql_error_exits_1),
+    ("[T13] 문자열 안의 ''와 ;는 적은 그대로 저장되고 조회된다",
+     quote_and_semicolon_in_text_are_stored_as_written),
+    ("[T14] 마지막 ;가 빠진 파일, 닫히지 않은 문자열, -- 주석은 파일의 줄 번호가 있는 문법 오류이다",
+     syntax_error_names_line_in_file),
+    ("[T15] 세 번째 문장이 틀린 파일은 앞의 INSERT 두 개를 남기고 네 번째 문장을 실행하지 않는다",
+     error_keeps_earlier_inserts_and_skips_later_statements),
+    ("[T16] NUL 바이트가 든 SQL 파일은 문장을 실행하지 않고 종료 코드 1로 끝난다",
+     nul_byte_in_sql_file_exits_1),
+    ("[T17] 문장마다 stderr에 메타 줄 하나를 쓴다",
+     meta_lines_go_to_stderr_one_per_statement),
+    ("[T18] -q는 INSERT 메타 줄만 끄고 SELECT 결과와 메타 줄은 그대로 둔다",
+     quiet_option_hides_insert_meta_lines_only),
 ]
 
 
