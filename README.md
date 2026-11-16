@@ -11,7 +11,7 @@ Krafton Jungle Week 11-12: SQL processor, B+ tree index, and a thread-pool API s
 [소개](#소개) · [Phase](#phase) · [설치 및 실행](#설치-및-실행) · [개발 방식](#개발-방식) · [API](#api) · [구조](#구조) · [성능 비교](#성능-비교) · [알려진 한계](#알려진-한계) · [파일 트리](#파일-트리) · [문서](#문서) · [Team](#team)
 
 > [!NOTE]
-> API, 구조, 성능 비교, 알려진 한계 절은 자리만 잡아 둔 것입니다. 팀 회의에서 최종 PRD가 정해지면 각 절을 최종 PRD의 내용으로 바꿉니다. 각자의 PRD 초안은 [`docs/prd/`](docs/prd/)에 있습니다.
+> 설계는 최종 PRD [`docs/prd/final.md`](docs/prd/final.md)에 있고, 구현 순서는 [`docs/prd/issues/`](docs/prd/issues/)의 티켓 01\~13입니다. 이 README는 `main`에 있는 코드의 현재 모습을 적습니다. API, 구조, 성능 비교, 알려진 한계 절은 각 절을 채우는 티켓이 구현과 함께 채웁니다. 각자의 PRD 초안도 [`docs/prd/`](docs/prd/)에 있습니다.
 
 ## 소개
 
@@ -61,10 +61,16 @@ cd mini-dbms
 make verify
 ```
 
-현재 CLI는 SQL 파일 경로를 인자 하나로 받는 단계입니다. 파일을 읽거나 SQL을 실행하는 기능은 Phase 1에서 추가합니다. 경로를 생략하면 사용법을 출력하고 종료합니다.
+현재 CLI는 SQL 파일 경로를 인자 하나로 받는 단계입니다. 파일을 읽거나 SQL을 실행하는 기능은 티켓 01부터 더합니다. 경로를 생략하면 사용법을 출력하고 종료 코드 2로 끝납니다.
 
 ```bash
 ./build/mini-dbms example.sql
+```
+
+최종 PRD가 정한 CLI는 아래 모양입니다. `--data`는 데이터 폴더(스키마 파일과 데이터 파일이 있는 곳), `-q`는 INSERT 결과 출력을 끕니다. SELECT 결과는 stdout에 TSV로, 접근 경로와 읽은 레코드 수는 stderr에 한 줄로 씁니다. 종료 코드는 0(성공), 1(파일·SQL·실행 오류), 2(잘못된 인자)입니다. 바이너리 데이터 파일을 사람이 읽는 줄로 보는 `dump` 명령은 티켓 03이 더하고, 사용법을 이 절에 적습니다.
+
+```text
+mini-dbms [--data 폴더] [-q] <SQL 파일>
 ```
 
 필요한 검사만 따로 실행할 수도 있습니다.
@@ -98,19 +104,19 @@ PR을 올리거나 고칠 때마다 GitHub Actions가 `make verify`를 실행합
 
 ## API
 
-Phase 3에서 외부 클라이언트가 DBMS를 부르는 방법입니다. 프로토콜(HTTP 등)과 요청, 응답, 오류의 형식은 최종 PRD에서 정합니다.
+Phase 3에서 외부 클라이언트가 DBMS를 부르는 방법입니다. 최종 PRD가 정한 모양은 `POST /query`에 SQL 문장 하나를 본문으로 보내고 JSON을 받는 HTTP/1.1 API입니다(`docs/prd/final.md` § Phase 3). 요청, 응답, 상태 코드 표는 티켓 10이 구현과 함께 이 절에 쓰고, 티켓 11\~13이 더합니다.
 
 ## 구조
 
-SQL 한 문장이 처리기, 인덱스, 테이블 파일을 지나는 흐름과, API 서버와 스레드 풀이 그 엔진을 감싸는 모양을 그림 한 장으로 보여 줍니다. 최종 PRD 확정 후 그립니다.
+SQL 한 문장이 처리기, 인덱스, 데이터 파일을 지나는 흐름과, API 서버와 스레드 풀이 그 엔진을 감싸는 모양을 그림 한 장으로 보여 줍니다. 설계 그림은 `docs/prd/final.md` § Solution에 있고, 이 절은 코드가 그 모양을 갖춘 뒤에 그립니다.
 
 ## 성능 비교
 
-Phase 2의 ID 기준 SELECT(인덱스 사용)와 다른 필드 기준 SELECT(선형 탐색)의 속도 차이를 적습니다. 측정 기록은 [`docs/measurements/`](docs/measurements/)에 측정 한 번마다 파일 하나로 남깁니다.
+Phase 2의 ID 기준 SELECT(인덱스 사용)와 다른 필드 기준 SELECT(선형 탐색)의 속도 차이를 적습니다. 티켓 08이 결론과 측정 기록 링크를 채웁니다. 측정 기록은 [`docs/measurements/`](docs/measurements/)에 측정 한 번마다 파일 하나로 남깁니다.
 
 ## 알려진 한계
 
-최종 PRD의 Out of Scope에서 옮깁니다.
+티켓마다 그 티켓이 만드는 한계를 한 줄씩 더합니다(티켓 01, 02, 04, 10, 12, 13). 전체 목록은 `docs/prd/final.md` § Further Notes에 있고, 일부러 하지 않는 기능은 같은 문서의 Out of Scope에 있습니다.
 
 ## 파일 트리
 
@@ -124,7 +130,7 @@ mini-dbms/
 │  ├─ check-ids.py   테스트 ID와 ADR 이름 검사
 │  └─ convention.py  코드 규칙 검사(make lint)와 자동 수정(make format)
 ├─ docs/
-│  ├─ prd/              각자의 PRD 초안(<이니셜>.md)과 최종 PRD
+│  ├─ prd/              각자의 PRD 초안(<이니셜>.md), 최종 PRD(final.md), 티켓(issues/)
 │  ├─ requirements.md   LMS 요구사항과 우리 해석
 │  ├─ measurements/     측정 기록
 │  ├─ adr/              큰 설계 결정
