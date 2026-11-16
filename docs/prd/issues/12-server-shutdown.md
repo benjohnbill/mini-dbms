@@ -4,7 +4,7 @@
 
 **Blocked by:** 11
 
-**Status:** ready-for-agent
+**Status:** done
 
 ## 순서
 
@@ -46,3 +46,7 @@ SIGINT
 - [ ] 두 번째 SIGINT 때 실행 중이던 INSERT는 완전한 record로 남고, 다음 시작이 성공합니다.
 - [ ] 두 번째 SIGINT 때 대기열에만 있던 INSERT는 파일에 남지 않습니다.
 - [ ] 종료 테스트가 `make tsan`에서도 통과합니다.
+
+## Comments
+
+- 2026-11-17: `CJG` 브랜치에 구현하고 병합했습니다(마지막 커밋 `2188da0`). 코드 리뷰 수정은 `04214c5`\~`6b7c2be`입니다. `main`으로 가는 PR에서 닫습니다.
