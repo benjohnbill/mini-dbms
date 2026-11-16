@@ -34,3 +34,5 @@ jobs:
       - run: pip install clang-format==21.1.8 clang-tidy==21.1.6
       - run: clang-format --version && clang-tidy --version
       - run: make verify
+      # 동시성 테스트를 ThreadSanitizer 빌드로 다시 돌립니다. 경고가 하나라도 나오면 실패합니다.
+      - run: make tsan

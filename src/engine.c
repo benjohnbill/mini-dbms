@@ -11,6 +11,7 @@
 #include <sys/file.h>
 #include <unistd.h>
 
+#include "rwlock.h"
 #include "sql.h"
 #include "table.h"
 
@@ -18,11 +19,15 @@
 #define LOCK_FILE_NAME ".lock"
 #define LOCK_PATH_BYTES 1024
 
-/* lock_fd는 잠금 파일을 연 fd이고, 닫으면 잠금이 풀립니다. */
+/* lock_fd는 잠금 파일을 연 fd이고, 닫으면 잠금이 풀립니다.
+   table_locks[i]는 tables[i]의 쓰기 우선 잠금입니다. 테이블 목록은 시작
+   뒤에 바뀌지 않으므로 목록 자체에는 잠금이 없습니다. */
 struct engine {
     int lock_fd;
     struct table **tables;
     size_t table_count;
+    struct rwlock *table_locks;
+    size_t table_lock_count;
 };
 
 static int engine_lock_data_dir(struct engine *engine, const char *data_dir,
@@ -30,12 +35,17 @@ static int engine_lock_data_dir(struct engine *engine, const char *data_dir,
 static int engine_load_tables(struct engine *engine, const char *data_dir,
                               char *error, size_t error_size);
 static int engine_add_table(struct engine *engine, struct table *table);
+static int engine_init_table_locks(struct engine *engine, char *error,
+                                   size_t error_size);
+static void execute_locked(struct table *table, struct rwlock *lock,
+                           const struct statement *statement,
+                           struct engine_result *result);
 static void result_fail(struct engine_result *result,
                         enum engine_error_reason code, const char *format, ...);
 static void result_set_sql_error(struct engine_result *result,
                                  const struct sql_error *sql_error);
-static struct table *engine_find_table(const struct engine *engine,
-                                       const char *name);
+static bool engine_find_table(const struct engine *engine, const char *name,
+                              size_t *table_index);
 static void execute_insert(struct table *table,
                            const struct statement *statement,
                            struct engine_result *result);
@@ -74,7 +84,8 @@ struct engine *engine_create(const char *data_dir,
     /* 다른 프로세스가 같은 파일을 쓰는 중에 읽지 않도록, 스키마와 테이블
        파일을 읽기 전에 잠급니다. */
     if (engine_lock_data_dir(engine, data_dir, error, error_size) != 0 ||
-        engine_load_tables(engine, data_dir, error, error_size) != 0) {
+        engine_load_tables(engine, data_dir, error, error_size) != 0 ||
+        engine_init_table_locks(engine, error, error_size) != 0) {
         engine_destroy(engine);
         return NULL;
     }
@@ -89,7 +100,7 @@ struct engine_result *engine_execute(struct engine *engine, const char *sql,
     const char *statement_end = sql;
     struct sql_error sql_error;
     enum sql_status sql_status;
-    struct table *table;
+    size_t table_index;
 
     if (result == NULL) {
         return NULL;
@@ -109,19 +120,12 @@ struct engine_result *engine_execute(struct engine *engine, const char *sql,
     /* 검증 오류는 문장의 첫 토큰을 가리킵니다. 성공하면 쓰지 않습니다. */
     result->error_line = statement->line;
     result->error_byte_in_line = statement->byte_in_line;
-    table = engine_find_table(engine, statement->table);
-    if (table == NULL) {
+    if (engine_find_table(engine, statement->table, &table_index)) {
+        execute_locked(engine->tables[table_index],
+                       &engine->table_locks[table_index], statement, result);
+    } else {
         result_fail(result, ENGINE_REASON_NO_TABLE, "없는 테이블입니다: %s",
                     statement->table);
-    } else if (!table->available) {
-        /* 되돌리기가 실패한 테이블은 파일 상태를 알 수 없으므로 읽지도
-           쓰지도 않습니다. 재시작하면 시작할 때 읽기가 파일을 판정합니다. */
-        result_fail(result, ENGINE_REASON_TABLE_UNAVAILABLE,
-                    "%s: table is unavailable until restart", statement->table);
-    } else if (statement->kind == STATEMENT_INSERT) {
-        execute_insert(table, statement, result);
-    } else {
-        execute_select(table, statement, result);
     }
     sql_statement_destroy(statement);
 
@@ -155,6 +159,10 @@ void engine_destroy(struct engine *engine)
         table_destroy(engine->tables[i]);
     }
     free(engine->tables);
+    for (size_t i = 0; i < engine->table_lock_count; i++) {
+        rwlock_destroy(&engine->table_locks[i]);
+    }
+    free(engine->table_locks);
     if (engine->lock_fd >= 0) {
         close(engine->lock_fd);
     }
@@ -238,6 +246,64 @@ static int engine_add_table(struct engine *engine, struct table *table)
     return 0;
 }
 
+/* 테이블마다 쓰기 우선 잠금 하나를 만듭니다. 테이블을 다 읽은 뒤에 한 번에
+   할당합니다. 테이블 배열처럼 realloc하면 이미 초기화한 mutex가 옮겨지기
+   때문입니다. */
+static int engine_init_table_locks(struct engine *engine, char *error,
+                                   size_t error_size)
+{
+    if (engine->table_count == 0) {
+        return 0;
+    }
+    engine->table_locks =
+        calloc(engine->table_count, sizeof(*engine->table_locks));
+    if (engine->table_locks == NULL) {
+        snprintf(error, error_size, "메모리가 부족합니다");
+        return -1;
+    }
+    for (size_t i = 0; i < engine->table_count; i++) {
+        if (rwlock_init(&engine->table_locks[i]) != 0) {
+            snprintf(error, error_size, "테이블 잠금을 만들지 못했습니다");
+            return -1;
+        }
+        engine->table_lock_count++;
+    }
+    return 0;
+}
+
+/* 실행 단계 전체를 테이블의 잠금 안에서 합니다. SELECT는 읽기 잠금,
+   INSERT는 쓰기 잠금입니다. ID 발급, 파일 쓰기, 트리 등록, 실패 시
+   되돌리기가 모두 이 쓰기 잠금 안에 들어가므로, 그 아래 함수는 잠금을 다시
+   잡지 않습니다. available도 되돌리기가 쓰기 잠금 안에서 바꾸므로 잠금
+   안에서 읽습니다. */
+static void execute_locked(struct table *table, struct rwlock *lock,
+                           const struct statement *statement,
+                           struct engine_result *result)
+{
+    bool writes = statement->kind == STATEMENT_INSERT;
+
+    if (writes) {
+        rwlock_write_lock(lock);
+    } else {
+        rwlock_read_lock(lock);
+    }
+    if (!table->available) {
+        /* 되돌리기가 실패한 테이블은 파일 상태를 알 수 없으므로 읽지도
+           쓰지도 않습니다. 재시작하면 시작할 때 읽기가 파일을 판정합니다. */
+        result_fail(result, ENGINE_REASON_TABLE_UNAVAILABLE,
+                    "%s: table is unavailable until restart", table->name);
+    } else if (writes) {
+        execute_insert(table, statement, result);
+    } else {
+        execute_select(table, statement, result);
+    }
+    if (writes) {
+        rwlock_write_unlock(lock);
+    } else {
+        rwlock_read_unlock(lock);
+    }
+}
+
 static void result_fail(struct engine_result *result,
                         enum engine_error_reason code, const char *format, ...)
 {
@@ -266,15 +332,16 @@ static void result_set_sql_error(struct engine_result *result,
     result->error_byte_in_line = sql_error->byte_in_line;
 }
 
-static struct table *engine_find_table(const struct engine *engine,
-                                       const char *name)
+static bool engine_find_table(const struct engine *engine, const char *name,
+                              size_t *table_index)
 {
     for (size_t i = 0; i < engine->table_count; i++) {
         if (strcmp(engine->tables[i]->name, name) == 0) {
-            return engine->tables[i];
+            *table_index = i;
+            return true;
         }
     }
-    return NULL;
+    return false;
 }
 
 /* 값 개수와 타입을 스키마와 먼저 맞춘 뒤에 파일에 씁니다. */

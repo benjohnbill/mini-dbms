@@ -1,5 +1,6 @@
 #include <dirent.h>
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -936,6 +937,408 @@ static void select_reports_scan_and_records_examined_test(void)
     data_dir_remove();
 }
 
+/* 동시성 테스트의 스레드는 acutest 매크로를 부르지 않습니다. TEST_ASSERT가
+   스레드 안에서 테스트를 끝낼 수 없기 때문입니다. 스레드는 본 것을 칸에
+   적고, 검사는 join 뒤에 main 스레드가 합니다. */
+
+#define CONCURRENT_INSERTS 100
+#define MIXED_WRITERS 4
+#define MIXED_INSERTS_PER_WRITER 50
+#define MIXED_RECORDS (MIXED_WRITERS * MIXED_INSERTS_PER_WRITER)
+#define MIXED_READERS 4
+#define SQL_MAX_LEN 128
+#define MARK_MAX_LEN 32
+/* 다른 테이블을 기다리면 이 테스트는 멈춥니다. 멈춘 테스트를 실패로 바꾸는
+   시간이며, 순서를 맞추는 데는 쓰지 않습니다. */
+#define HANG_LIMIT_SECONDS 20
+
+/* 모든 스레드가 만들어진 뒤에 함께 출발시킵니다. pthread_barrier는 macOS에
+   없어 mutex와 조건 변수로 만듭니다. */
+struct start_gate {
+    pthread_mutex_t mutex;
+    pthread_cond_t opened;
+    bool open;
+};
+
+struct concurrent_insert {
+    struct engine *engine;
+    struct start_gate *gate;
+    int mark;
+    enum engine_status status;
+    int64_t inserted_id;
+};
+
+struct mixed_run {
+    struct engine *engine;
+    struct start_gate gate;
+    pthread_mutex_t mutex;
+    int writers_left;
+};
+
+struct mixed_writer {
+    struct mixed_run *run;
+    int first_mark;
+    int64_t id_of_mark[MIXED_INSERTS_PER_WRITER];
+    bool failed;
+};
+
+/* mark_of_id[id]는 그 id의 record에서 본 age입니다. 0은 아직 못 본
+   것입니다. */
+struct mixed_reader {
+    struct mixed_run *run;
+    int mark_of_id[MIXED_RECORDS + 1];
+    int selects;
+    char problem[ENGINE_ERROR_MAX];
+};
+
+static void start_gate_init(struct start_gate *gate)
+{
+    pthread_mutex_init(&gate->mutex, NULL);
+    pthread_cond_init(&gate->opened, NULL);
+    gate->open = false;
+}
+
+static void start_gate_destroy(struct start_gate *gate)
+{
+    pthread_mutex_destroy(&gate->mutex);
+    pthread_cond_destroy(&gate->opened);
+}
+
+static void start_gate_open(struct start_gate *gate)
+{
+    pthread_mutex_lock(&gate->mutex);
+    gate->open = true;
+    pthread_cond_broadcast(&gate->opened);
+    pthread_mutex_unlock(&gate->mutex);
+}
+
+static void start_gate_wait(struct start_gate *gate)
+{
+    pthread_mutex_lock(&gate->mutex);
+    while (!gate->open) {
+        pthread_cond_wait(&gate->opened, &gate->mutex);
+    }
+    pthread_mutex_unlock(&gate->mutex);
+}
+
+static void *concurrent_insert_main(void *arg)
+{
+    struct concurrent_insert *insert = arg;
+    char sql[SQL_MAX_LEN];
+    struct engine_result *result;
+
+    snprintf(sql, sizeof(sql),
+             "INSERT INTO users VALUES ('mark-%d', 'mark-%d@x', %d);",
+             insert->mark, insert->mark, insert->mark);
+    start_gate_wait(insert->gate);
+    result = engine_execute(insert->engine, sql, NULL);
+    if (result != NULL) {
+        insert->status = result->status;
+        insert->inserted_id = result->inserted_id;
+        engine_result_destroy(result);
+    }
+    return NULL;
+}
+
+static void concurrent_inserts_get_ids_one_to_hundred_test(void)
+{
+    struct engine *engine = users_engine_create();
+    struct start_gate gate;
+    struct concurrent_insert inserts[CONCURRENT_INSERTS] = {0};
+    pthread_t threads[CONCURRENT_INSERTS];
+    bool id_seen[CONCURRENT_INSERTS + 1] = {false};
+
+    start_gate_init(&gate);
+    for (int i = 0; i < CONCURRENT_INSERTS; i++) {
+        inserts[i] = (struct concurrent_insert){.engine = engine,
+                                                .gate = &gate,
+                                                .mark = i + 1,
+                                                .status = ENGINE_ERROR};
+        TEST_ASSERT(pthread_create(&threads[i], NULL, concurrent_insert_main,
+                                   &inserts[i]) == 0);
+    }
+    start_gate_open(&gate);
+    for (int i = 0; i < CONCURRENT_INSERTS; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    start_gate_destroy(&gate);
+
+    for (int i = 0; i < CONCURRENT_INSERTS; i++) {
+        int64_t new_id = inserts[i].inserted_id;
+
+        TEST_CHECK(inserts[i].status == ENGINE_OK);
+        TEST_ASSERT(new_id >= 1 && new_id <= CONCURRENT_INSERTS);
+        TEST_CHECK(!id_seen[new_id]);
+        TEST_MSG("id %lld was given twice", (long long)new_id);
+        id_seen[new_id] = true;
+    }
+    for (int i = 0; i < CONCURRENT_INSERTS; i++) {
+        char sql[SQL_MAX_LEN];
+        char mark[MARK_MAX_LEN];
+        struct engine_result *result;
+
+        snprintf(sql, sizeof(sql), "SELECT name FROM users WHERE id = %lld;",
+                 (long long)inserts[i].inserted_id);
+        snprintf(mark, sizeof(mark), "mark-%d", inserts[i].mark);
+        result = execute_one(engine, sql);
+        TEST_CHECK(result->status == ENGINE_OK);
+        TEST_ASSERT(result->record_count == 1);
+        check_text(&result->values[0], mark);
+        engine_result_destroy(result);
+    }
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
+static void *mixed_writer_main(void *arg)
+{
+    struct mixed_writer *writer = arg;
+    struct mixed_run *run = writer->run;
+
+    start_gate_wait(&run->gate);
+    for (int i = 0; i < MIXED_INSERTS_PER_WRITER; i++) {
+        int mark = writer->first_mark + i;
+        char sql[SQL_MAX_LEN];
+        struct engine_result *result;
+
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO users VALUES ('n%d', 'e%d', %d);", mark, mark,
+                 mark);
+        result = engine_execute(run->engine, sql, NULL);
+        if (result == NULL || result->status != ENGINE_OK) {
+            writer->failed = true;
+        } else {
+            writer->id_of_mark[i] = result->inserted_id;
+        }
+        engine_result_destroy(result);
+    }
+    pthread_mutex_lock(&run->mutex);
+    run->writers_left--;
+    pthread_mutex_unlock(&run->mutex);
+    return NULL;
+}
+
+static bool mixed_run_is_writing(struct mixed_run *run)
+{
+    bool writing;
+
+    pthread_mutex_lock(&run->mutex);
+    writing = run->writers_left > 0;
+    pthread_mutex_unlock(&run->mutex);
+    return writing;
+}
+
+/* text 값이 prefix 뒤에 mark를 붙인 문자열인지 봅니다. */
+static bool text_is_mark(const struct value *value, char prefix, int mark)
+{
+    char expected[MARK_MAX_LEN];
+    int expected_len =
+        snprintf(expected, sizeof(expected), "%c%d", prefix, mark);
+
+    return value->type == VALUE_TEXT &&
+           value->text_len == (uint32_t)expected_len &&
+           memcmp(value->text, expected, (size_t)expected_len) == 0;
+}
+
+/* SELECT * 결과 하나를 확인합니다. id는 1부터 빈틈없이 이어지고, 각
+   record의 세 field는 같은 mark로 쓴 짝이어야 합니다. 문제가 있으면
+   reader->problem에 적습니다. */
+static void mixed_reader_check(struct mixed_reader *reader,
+                               const struct engine_result *result)
+{
+    for (size_t i = 0; i < result->record_count; i++) {
+        const struct value *record_values = &result->values[i * 4];
+        int64_t found_id = record_values[0].integer;
+        int mark = (int)record_values[3].integer;
+
+        if (found_id != (int64_t)i + 1 || found_id > MIXED_RECORDS) {
+            snprintf(reader->problem, sizeof(reader->problem),
+                     "record %zu has id %lld", i, (long long)found_id);
+            return;
+        }
+        if (!text_is_mark(&record_values[1], 'n', mark) ||
+            !text_is_mark(&record_values[2], 'e', mark)) {
+            snprintf(reader->problem, sizeof(reader->problem),
+                     "id %lld has fields from different inserts",
+                     (long long)found_id);
+            return;
+        }
+        if (reader->mark_of_id[found_id] != 0 &&
+            reader->mark_of_id[found_id] != mark) {
+            snprintf(reader->problem, sizeof(reader->problem),
+                     "id %lld changed from mark %d to %d", (long long)found_id,
+                     reader->mark_of_id[found_id], mark);
+            return;
+        }
+        reader->mark_of_id[found_id] = mark;
+    }
+}
+
+static void *mixed_reader_main(void *arg)
+{
+    struct mixed_reader *reader = arg;
+    struct mixed_run *run = reader->run;
+    bool writing = true;
+
+    start_gate_wait(&run->gate);
+    /* 쓰기가 끝난 뒤에도 한 번 더 읽어, 적어도 한 번은 읽게 합니다. */
+    while (writing && reader->problem[0] == '\0') {
+        struct engine_result *result;
+
+        writing = mixed_run_is_writing(run);
+        result = engine_execute(run->engine, "SELECT * FROM users;", NULL);
+        if (result == NULL || result->status != ENGINE_OK) {
+            snprintf(reader->problem, sizeof(reader->problem), "SELECT failed");
+        } else {
+            mixed_reader_check(reader, result);
+        }
+        engine_result_destroy(result);
+        reader->selects++;
+    }
+    return NULL;
+}
+
+static void scan_during_inserts_sees_only_whole_records_test(void)
+{
+    static struct mixed_writer writers[MIXED_WRITERS];
+    static struct mixed_reader readers[MIXED_READERS];
+    struct mixed_run run = {.engine = users_engine_create(),
+                            .writers_left = MIXED_WRITERS};
+    pthread_t writer_threads[MIXED_WRITERS];
+    pthread_t reader_threads[MIXED_READERS];
+    int64_t mark_count[MIXED_RECORDS + 1] = {0};
+    int mark_of_id[MIXED_RECORDS + 1] = {0};
+
+    start_gate_init(&run.gate);
+    pthread_mutex_init(&run.mutex, NULL);
+    for (int i = 0; i < MIXED_WRITERS; i++) {
+        writers[i] = (struct mixed_writer){
+            .run = &run, .first_mark = i * MIXED_INSERTS_PER_WRITER + 1};
+        TEST_ASSERT(pthread_create(&writer_threads[i], NULL, mixed_writer_main,
+                                   &writers[i]) == 0);
+    }
+    for (int i = 0; i < MIXED_READERS; i++) {
+        readers[i] = (struct mixed_reader){.run = &run};
+        TEST_ASSERT(pthread_create(&reader_threads[i], NULL, mixed_reader_main,
+                                   &readers[i]) == 0);
+    }
+    start_gate_open(&run.gate);
+    for (int i = 0; i < MIXED_WRITERS; i++) {
+        pthread_join(writer_threads[i], NULL);
+    }
+    for (int i = 0; i < MIXED_READERS; i++) {
+        pthread_join(reader_threads[i], NULL);
+    }
+    pthread_mutex_destroy(&run.mutex);
+    start_gate_destroy(&run.gate);
+
+    /* 쓰기 스레드가 받은 id와 mark의 짝입니다. */
+    for (int i = 0; i < MIXED_WRITERS; i++) {
+        TEST_CHECK(!writers[i].failed);
+        for (int j = 0; j < MIXED_INSERTS_PER_WRITER; j++) {
+            int64_t new_id = writers[i].id_of_mark[j];
+
+            TEST_ASSERT(new_id >= 1 && new_id <= MIXED_RECORDS);
+            mark_count[new_id]++;
+            mark_of_id[new_id] = writers[i].first_mark + j;
+        }
+    }
+    for (int i = 1; i <= MIXED_RECORDS; i++) {
+        TEST_CHECK(mark_count[i] == 1);
+        TEST_MSG("id %d was given %lld times", i, (long long)mark_count[i]);
+    }
+    /* 읽기 스레드가 본 짝은 모두 쓰기 스레드가 받은 짝과 같아야 합니다. */
+    for (int i = 0; i < MIXED_READERS; i++) {
+        TEST_CHECK(readers[i].problem[0] == '\0');
+        TEST_MSG("reader %d: %s", i, readers[i].problem);
+        TEST_CHECK(readers[i].selects >= 1);
+        for (int k = 1; k <= MIXED_RECORDS; k++) {
+            int seen = readers[i].mark_of_id[k];
+
+            TEST_CHECK(seen == 0 || seen == mark_of_id[k]);
+            TEST_MSG("reader %d saw id %d with mark %d, inserted %d", i, k,
+                     seen, mark_of_id[k]);
+        }
+    }
+    engine_destroy(run.engine);
+    data_dir_remove();
+}
+
+/* 첫 호출만 테스트가 놓아 줄 때까지 멈추는 pwrite입니다. 멈춘 동안 그
+   INSERT는 자기 테이블의 쓰기 잠금을 쥐고 있습니다. */
+static struct start_gate held_write_entered;
+static struct start_gate held_write_release;
+static bool held_write_used;
+
+static ssize_t held_first_pwrite(int fd, const void *bytes, size_t size,
+                                 off_t offset)
+{
+    bool first;
+
+    pthread_mutex_lock(&held_write_entered.mutex);
+    first = !held_write_used;
+    held_write_used = true;
+    pthread_mutex_unlock(&held_write_entered.mutex);
+    if (first) {
+        start_gate_open(&held_write_entered);
+        start_gate_wait(&held_write_release);
+    }
+    return pwrite(fd, bytes, size, offset);
+}
+
+static void *held_users_insert_main(void *arg)
+{
+    struct engine_result *result = engine_execute(
+        arg, "INSERT INTO users VALUES ('kim', 'k@x', 20);", NULL);
+    enum engine_status *status = malloc(sizeof(*status));
+
+    if (status != NULL) {
+        *status = result == NULL ? ENGINE_ERROR : result->status;
+    }
+    engine_result_destroy(result);
+    return status;
+}
+
+static void other_tables_do_not_wait_for_each_other_test(void)
+{
+    struct engine *engine = users_and_items_engine_create();
+    struct engine_result *result;
+    pthread_t users_thread;
+    void *users_status = NULL;
+
+    alarm(HANG_LIMIT_SECONDS);
+    start_gate_init(&held_write_entered);
+    start_gate_init(&held_write_release);
+    held_write_used = false;
+    table_file_functions.write_at = held_first_pwrite;
+    TEST_ASSERT(pthread_create(&users_thread, NULL, held_users_insert_main,
+                               engine) == 0);
+    start_gate_wait(&held_write_entered);
+
+    /* users의 INSERT가 쓰기 잠금을 쥔 채 멈춰 있어도 items는 읽고 씁니다. */
+    result = execute_one(engine, "INSERT INTO items VALUES ('pen');");
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_CHECK(result->inserted_id == 1);
+    engine_result_destroy(result);
+    result = execute_one(engine, "SELECT * FROM items;");
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_CHECK(result->record_count == 1);
+    engine_result_destroy(result);
+
+    start_gate_open(&held_write_release);
+    pthread_join(users_thread, &users_status);
+    TEST_CHECK(users_status != NULL &&
+               *(enum engine_status *)users_status == ENGINE_OK);
+    free(users_status);
+    table_file_functions.write_at = pwrite;
+    start_gate_destroy(&held_write_entered);
+    start_gate_destroy(&held_write_release);
+    alarm(0);
+    check_only_kim(engine);
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
 TEST_LIST = {
     {"[T6] INSERT는 ID 1을 받고 SELECT *가 그 record를 돌려준다",
      insert_returns_id_and_select_returns_record_test},
@@ -1020,6 +1423,15 @@ TEST_LIST = {
     {"SELECT는 접근 경로 SCAN과 읽은 레코드 수를 돌려주고 타입 오류는 레코드를 "
      "읽지 않는다",
      select_reports_scan_and_records_examined_test},
+    {"[T123] 빈 테이블에 스레드 100개가 INSERT를 하나씩 보내면 ID 1~100을 "
+     "하나씩 받고, 각 INSERT의 표식이 그 ID로 조회된다",
+     concurrent_inserts_get_ids_one_to_hundred_test},
+    {"[T124] SCAN과 INSERT를 섞어 돌려도 SELECT는 반쯤 쓰인 record를 보지 "
+     "않고, 본 id와 데이터는 INSERT가 받은 짝과 같다",
+     scan_during_inserts_sees_only_whole_records_test},
+    {"[T125] 한 테이블의 INSERT가 쓰기 잠금을 쥐고 멈춰 있어도 다른 테이블의 "
+     "INSERT와 SELECT는 기다리지 않는다",
+     other_tables_do_not_wait_for_each_other_test},
     {NULL, NULL},
 };
 
