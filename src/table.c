@@ -340,17 +340,17 @@ static int read_full(int fd, void *bytes, size_t size, uint64_t offset)
     unsigned char *cursor = bytes;
 
     while (size > 0) {
-        ssize_t got = pread(fd, cursor, size, (off_t)offset);
+        ssize_t read_len = pread(fd, cursor, size, (off_t)offset);
 
-        if (got < 0 && errno == EINTR) {
+        if (read_len < 0 && errno == EINTR) {
             continue;
         }
-        if (got <= 0) {
+        if (read_len <= 0) {
             return -1;
         }
-        cursor += got;
-        size -= (size_t)got;
-        offset += (uint64_t)got;
+        cursor += read_len;
+        size -= (size_t)read_len;
+        offset += (uint64_t)read_len;
     }
     return 0;
 }
