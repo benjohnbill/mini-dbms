@@ -29,7 +29,7 @@ LMS는 과제를 세 단계로 나눕니다. 마일스톤은 따로 두지 않�
 |---|---|---|---|---|
 | 1 | **SQL 처리기.** 텍스트 파일에 적은 SQL을 CLI로 넘기면 파싱하고 실행합니다. `INSERT`는 테이블 파일에 데이터를 더하고, `SELECT`는 테이블 파일에서 데이터를 읽어 출력합니다. | SQL이 올바르게 파싱되고 실행되는지 | L7\~L19, L35\~L38, L47 | 완료(티켓 01\~05) |
 | 2 | **B+ 트리 인덱스.** 레코드가 추가될 때마다 ID를 자동으로 부여하고, 그 ID를 B+ 트리에 등록합니다. ID로 찾는 `SELECT`는 B+ 트리를 사용합니다. | 레코드 100만 건 이상에서 ID 조회(인덱스 사용)와 다른 필드 조회(처음부터 끝까지 탐색)의 속도 차이 | L20\~L26, L39\~L41, L48 | 완료(티켓 06\~08) |
-| 3 | **API 서버.** 외부 클라이언트가 HTTP로 SQL을 보내면, 스레드 풀이 요청을 나눠 받아 병렬로 처리합니다. | 여러 요청이 동시에 들어와도 결과가 맞는지 | L27\~L30, L42\~L44, L49 | 진행 중: 티켓 09, 10 완료, 11\~13 남음 |
+| 3 | **API 서버.** 외부 클라이언트가 HTTP로 SQL을 보내면, 스레드 풀이 요청을 나눠 받아 병렬로 처리합니다. | 여러 요청이 동시에 들어와도 결과가 맞는지 | L27\~L30, L42\~L44, L49 | 완료(티켓 09\~13) |
 
 요구사항 ID는 [`docs/requirements.md`](docs/requirements.md)에 있습니다. L50(엣지 케이스)은 모든 Phase의 테스트에 들어갑니다. 개발 환경(빌드, 테스트 도구, 코드 규칙 검사, CI)은 준비를 마쳤습니다.
 
@@ -228,7 +228,44 @@ curl -s --data-binary 'SELECT * FROM users;' 'http://127.0.0.1:8080/query?cursor
 
 ## 구조
 
-SQL 한 문장이 처리기, 인덱스, 데이터 파일을 지나는 흐름과, API 서버와 스레드 풀이 그 엔진을 감싸는 모양을 그림 한 장으로 보여 줍니다. 설계 그림은 `docs/prd/final.md` § Solution에 있고, 이 절은 코드가 그 모양을 갖춘 뒤에 그립니다.
+SQL 한 문장이 CLI나 API 서버에서 엔진, 잠금, 데이터 파일까지 가는 길을 `src/`의 파일과 함수 이름으로 그립니다. 화살표는 호출이고, 괄호 안은 그 함수가 있는 파일입니다.
+
+```text
+CLI (src/cli.c)                     API 서버 (src/server.c)
+main                                [이벤트 루프 스레드]
+ └ sql_run                           connection_event_handle
+    └ engine_execute(sql, &next_sql)  → requests_handle → request_take
+      문장 하나씩, 다음 문장 위치로     → request_route → request_submit
+      다시 부름                         → work_queue_submit (src/work_queue.c)
+                                    [작업 스레드]
+                                     request_execute
+                                      → engine_execute(sql, NULL)
+                                        또는 engine_execute_from(sql, cursor)
+                                      → result_json_create  (잠금 밖)
+                                      → done_queue_push → mg_wakeup
+                                    [이벤트 루프 스레드]
+                                     done_replies_send → reply_send
+              │                                  │
+              └────────────────┬─────────────────┘
+                               ▼
+엔진 (src/engine.c)  execute_statement
+ ├ sql_parse (src/sql.c)                       잠금 밖: 토크나이저, 파서
+ └ engine_find_table → execute_locked
+    ├ rwlock_write_lock / rwlock_read_lock     테이블마다 쓰기 우선 잠금
+    │                                          (src/rwlock.c)
+    ├ INSERT: execute_insert → table_insert (src/table.c)
+    │          bptree_reserve → write_full(pwrite) → bptree_insert
+    │          → committed_size 올림. 쓰기 실패면 ftruncate로 되돌림
+    └ SELECT: execute_select → select_plan
+               ├ INDEX: table_index_create → bptree_find → record 1개 pread
+               └ SCAN:  table_scan_create(cursor) → scan_next(pread)
+                               ▼
+데이터 폴더: <테이블>.schema, <테이블>.tbl, .lock
+
+시작할 때: engine_create → engine_lock_data_dir(flock)
+           → engine_load_tables → table_create → table_records_load
+             (잘림과 손상 판정, 다음 ID, B+ 트리 다시 만들기)
+```
 
 ## 성능 비교
 
@@ -257,14 +294,15 @@ SQL 한 문장이 처리기, 인덱스, 데이터 파일을 지나는 흐름과,
 ```
 mini-dbms/
 ├─ Makefile          make verify, make test, make functional, make lint,
-│                    make tsan, make bench
+│                    make tsan, make bench, make bench-cursor
 ├─ LICENSE           GPLv2 (Mongoose를 함께 배포하기 때문)
 ├─ src/
 │  ├─ cli.c          CLI 진입점. SQL 파일을 문장 하나씩 엔진에 넘기고 TSV로 출력, dump 명령
 │  ├─ server.c       API 서버 진입점. Mongoose 이벤트 루프, POST /query, JSON 응답
 │  ├─ work_queue.[ch]  작업 스레드와 작업 대기열
-│  ├─ engine.[ch]    엔진 공개 함수 네 개(engine_create, engine_execute,
-│  │                 engine_result_destroy, engine_destroy), 데이터 폴더 잠금,
+│  ├─ engine.[ch]    엔진 공개 함수(engine_create, engine_execute,
+│  │                 engine_execute_from, engine_result_destroy,
+│  │                 engine_destroy), 데이터 폴더 잠금, 결과 상한과 커서,
 │  │                 planner(INDEX 또는 SCAN), 테이블마다 쓰기 우선 잠금
 │  ├─ rwlock.[ch]    쓰기 우선 읽기·쓰기 잠금(mutex와 조건 변수 두 개)
 │  ├─ sql.[ch]       토크나이저와 재귀 하강 파서
@@ -288,6 +326,7 @@ mini-dbms/
 ├─ scripts/
 │  ├─ generate-users.py  시드를 고정한 INSERT 문 SQL 파일 생성
 │  ├─ bench.py           100만 건 적재와 INDEX 대 SCAN 측정(make bench)
+│  ├─ bench-cursor.py    커서 부분 크기 측정(make bench-cursor)
 │  ├─ check-ids.py       테스트 ID와 ADR 이름 검사
 │  └─ convention.py      코드 규칙 검사(make lint)와 자동 수정(make format)
 ├─ docs/
