@@ -38,6 +38,10 @@ static unsigned char *file_bytes_create(const char *name, size_t *size);
 static ssize_t part_then_fail_pwrite(int fd, const void *bytes, size_t size,
                                      off_t offset);
 
+static int failing_ftruncate(int fd, off_t size);
+static struct engine *users_and_items_engine_create(void);
+static void check_table_unavailable(struct engine_result *result);
+
 static void data_dir_create(void);
 static void data_dir_remove(void);
 static struct engine *users_engine_create(void);
@@ -391,6 +395,54 @@ static void failed_write_with_rollback_keeps_file_and_id_test(void)
     data_dir_remove();
 }
 
+static void failed_rollback_stops_table_test(void)
+{
+    struct engine *engine = users_engine_create();
+    struct engine_result *result;
+
+    table_file_functions.write_at = part_then_fail_pwrite;
+    table_file_functions.truncate = failing_ftruncate;
+    result =
+        execute_one(engine, "INSERT INTO users VALUES ('lee', 'l@x', 31);");
+    table_file_functions.write_at = pwrite;
+    table_file_functions.truncate = ftruncate;
+    TEST_CHECK(strstr(result->error_message, "unknown whether") != NULL);
+    check_table_unavailable(result);
+
+    check_table_unavailable(execute_one(engine, "SELECT * FROM users;"));
+    check_table_unavailable(
+        execute_one(engine, "INSERT INTO users VALUES ('kim', 'k@x', 2);"));
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
+static void stopped_table_leaves_other_tables_working_test(void)
+{
+    struct engine *engine = users_and_items_engine_create();
+    struct engine_result *result;
+
+    table_file_functions.write_at = part_then_fail_pwrite;
+    table_file_functions.truncate = failing_ftruncate;
+    check_table_unavailable(
+        execute_one(engine, "INSERT INTO users VALUES ('lee', 'l@x', 31);"));
+    table_file_functions.write_at = pwrite;
+    table_file_functions.truncate = ftruncate;
+
+    result = execute_one(engine, "INSERT INTO items VALUES ('pen');");
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_CHECK(result->inserted_id == 1);
+    engine_result_destroy(result);
+    result = execute_one(engine, "SELECT * FROM items;");
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_ASSERT(result->record_count == 1);
+    check_text(&result->values[1], "pen");
+    engine_result_destroy(result);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
 TEST_LIST = {
     {"[T6] INSERT는 ID 1을 받고 SELECT *가 그 record를 돌려준다",
      insert_returns_id_and_select_returns_record_test},
@@ -422,6 +474,11 @@ TEST_LIST = {
     {"[T80] 쓰기가 실패하고 되돌리기가 성공하면 테이블 파일이 그대로이고 "
      "다음 INSERT가 실패한 INSERT의 ID를 받는다",
      failed_write_with_rollback_keeps_file_and_id_test},
+    {"[T81] 되돌리기도 실패하면 그 INSERT와 이후 같은 테이블의 SELECT, "
+     "INSERT가 모두 table_unavailable이다",
+     failed_rollback_stops_table_test},
+    {"[T82] 한 테이블이 멈춰도 다른 테이블의 INSERT와 SELECT는 성공한다",
+     stopped_table_leaves_other_tables_working_test},
     {NULL, NULL},
 };
 
@@ -530,4 +587,34 @@ static ssize_t part_then_fail_pwrite(int fd, const void *bytes, size_t size,
     }
     errno = ENOSPC;
     return -1;
+}
+
+static int failing_ftruncate(int fd, off_t size)
+{
+    (void)fd;
+    (void)size;
+    errno = EIO;
+    return -1;
+}
+
+/* users와 items(title TEXT) 두 테이블이 있는 데이터 폴더로 엔진을 엽니다. */
+static struct engine *users_and_items_engine_create(void)
+{
+    data_dir_create();
+    write_file("users.schema", "name TEXT\nemail TEXT\nage INT\n");
+    write_file("users.tbl", "");
+    write_file("items.schema", "title TEXT\n");
+    write_file("items.tbl", "");
+
+    return engine_reopen();
+}
+
+/* result가 table_unavailable 오류인지 확인하고 해제합니다. */
+static void check_table_unavailable(struct engine_result *result)
+{
+    TEST_CHECK(result->status == ENGINE_ERROR);
+    TEST_CHECK(result->error_reason == ENGINE_REASON_TABLE_UNAVAILABLE);
+    TEST_MSG("reason: %d, error: %s", (int)result->error_reason,
+             result->error_message);
+    engine_result_destroy(result);
 }

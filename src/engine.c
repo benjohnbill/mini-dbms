@@ -95,6 +95,12 @@ struct engine_result *engine_execute(struct engine *engine, const char *sql,
     table = engine_find_table(engine, statement->table);
     if (table == NULL) {
         result_fail(result, "no such table: %s", statement->table);
+    } else if (!table->available) {
+        /* 되돌리기가 실패한 테이블은 파일 상태를 알 수 없으므로 읽지도
+           쓰지도 않습니다. 재시작하면 시작할 때 읽기가 파일을 판정합니다. */
+        result_fail(result, "%s: table is unavailable until restart",
+                    statement->table);
+        result->error_reason = ENGINE_REASON_TABLE_UNAVAILABLE;
     } else if (statement->kind == STATEMENT_INSERT) {
         execute_insert(table, statement, result);
     } else {
