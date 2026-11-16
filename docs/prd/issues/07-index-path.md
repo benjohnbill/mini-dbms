@@ -12,12 +12,12 @@
 - **INSERT 순서에 트리 끼우기**: 티켓 05의 순서에서 1단계(파일을 건드리기 전)에 노드를 미리 할당하고, 파일 쓰기가 성공한 뒤 `committed_size`를 올리기 전에 트리에 `id → 쓰기 전 committed_size`를 넣습니다. 미리 할당이 실패하면 `out_of_memory`이고 파일은 바뀌지 않습니다.
 - **planner**: 검증을 통과한 SELECT에서, 조건이 `id = 정수`이면 INDEX, 그 밖은 SCAN입니다. INDEX는 트리에서 위치를 찾고 그 record 하나만 `pread`로 읽는 iterator입니다. 실행기는 SCAN과 INDEX를 같은 iterator 모양으로 받습니다. INDEX로 찾은 record를 조건과 다시 비교하지는 않습니다.
 - **결과 메타**: 결과 구조체에 접근 경로와 읽은 record 수를 담습니다. 티켓 02의 stderr 메타 줄이 `INDEX` 값을 보입니다. 없는 ID는 `INDEX`, 결과 0건, 읽은 record 수 0입니다.
-- **문서**: `docs/requirements.md`의 L20~L22, L39, L48(정확성) 행을 채웁니다.
+- **문서**: `docs/requirements.md`의 L20\~L22, L39, L48(정확성) 행을 채웁니다.
 
 완료 조건 (L48):
 
 - [ ] `WHERE id = 7`(있는 ID)은 접근 경로 `INDEX`, 결과 1건, 읽은 record 수 1입니다.
-- [ ] ID가 1~N인 테이블에서 `WHERE id = N+1`은 `INDEX`, 0건, 읽은 record 수 0입니다.
+- [ ] ID가 1\~N인 테이블에서 `WHERE id = N+1`은 `INDEX`, 0건, 읽은 record 수 0입니다.
 - [ ] `WHERE email = '…'`은 `SCAN`이고 읽은 record 수는 전체 record 수입니다.
 - [ ] `WHERE id = 'abc'`는 타입 오류이고 경로를 고르지 않습니다.
 - [ ] INSERT 직후의 `WHERE id = 새 ID`가 INDEX로 그 record를 찾습니다.
