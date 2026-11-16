@@ -99,6 +99,22 @@ static void destroy_runs_queued_jobs_first_test(void)
     alarm(0);
 }
 
+static void zero_capacity_queue_rejects_every_job_test(void)
+{
+    static int job = 1;
+    struct probe probe;
+    struct work_queue *queue;
+
+    probe_init(&probe);
+    probe.release = true;
+    queue = work_queue_create(1, 0, held_job_run, &probe);
+    TEST_ASSERT(queue != NULL);
+    TEST_CHECK(!work_queue_submit(queue, &job));
+    work_queue_destroy(queue);
+    TEST_CHECK(probe.ran_count == 0);
+    probe_destroy(&probe);
+}
+
 TEST_LIST = {
     {"[T161] 스레드가 작업 하나를 쥐고 멈춘 동안 대기열 칸이 다 차면 새 "
      "작업은 기다리지 않고 거절되고, 받은 작업은 넣은 순서로 실행된다",
@@ -107,6 +123,8 @@ TEST_LIST = {
      threads_run_jobs_at_the_same_time_test},
     {"대기열을 해제하면 남은 작업을 모두 실행한 뒤 스레드가 끝난다",
      destroy_runs_queued_jobs_first_test},
+    {"칸이 0인 대기열은 모든 작업을 거절하고 아무것도 실행하지 않는다",
+     zero_capacity_queue_rejects_every_job_test},
     {NULL, NULL},
 };
 

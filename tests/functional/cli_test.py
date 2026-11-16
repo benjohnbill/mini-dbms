@@ -378,6 +378,30 @@ def truncated_table_file_exits_1_and_keeps_file():
         shutil.rmtree(data_dir)
 
 
+def users_record_bytes(new_id, name, email, age):
+    """테이블 파일 레이아웃의 users record 하나입니다(GLOSSARY.md의 데이터 파일)."""
+    body = new_id.to_bytes(8, "little", signed=True)
+    for text in (name, email):
+        encoded = text.encode("utf-8")
+        body += len(encoded).to_bytes(4, "little") + encoded
+    body += age.to_bytes(8, "little", signed=True)
+    return len(body).to_bytes(4, "little") + body
+
+
+def cli_prints_all_10001_records_without_result_limit():
+    data_dir = make_data_dir()
+    try:
+        with open(os.path.join(data_dir, "users.tbl"), "wb") as f:
+            f.write(b"".join(users_record_bytes(i, "n", "e", i) for i in range(1, 10002)))
+        proc = run_sql(data_dir, "SELECT * FROM users;\n")
+        assert proc.returncode == 0, proc.stderr
+        lines = proc.stdout.split(b"\n")
+        assert len(lines) == 10003 and lines[-1] == b"", len(lines)
+        assert lines[1] == b"1\tn\te\t1" and lines[10001] == b"10001\tn\te\t10001", lines[10001]
+    finally:
+        shutil.rmtree(data_dir)
+
+
 TESTS = [
     ("[T1] 빈 데이터 폴더에서 INSERT 두 개와 SELECT *는 ID 1, 2인 record를 TSV로 출력한다",
      insert_two_and_select_prints_ids_1_and_2),
@@ -417,6 +441,8 @@ TESTS = [
     ("[T66] 잘린 테이블 파일이면 CLI는 파일 이름, 바이트 위치, record 번호, 잘림을 "
      "알리고 종료 코드 1로 끝나며 파일을 고치지 않는다",
      truncated_table_file_exits_1_and_keeps_file),
+    ("[T202] 결과 상한이 없는 CLI는 1만 1건을 돌려줄 SELECT의 record를 모두 출력한다",
+     cli_prints_all_10001_records_without_result_limit),
 ]
 
 

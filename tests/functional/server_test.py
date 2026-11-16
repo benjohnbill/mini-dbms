@@ -27,14 +27,28 @@ START_TIMEOUT = 10.0
 STOP_TIMEOUT = 10.0
 REQUEST_TIMEOUT = 10.0
 CONCURRENT_INSERTS = 100
+BODY_MAX = 1 << 20
+IDLE_TIMEOUT_MS = 300
 SANITIZER_MARKS = ("WARNING: ThreadSanitizer", "ERROR: AddressSanitizer", "ERROR: LeakSanitizer", "runtime error:")
 
 
-def make_data_dir():
+def users_record_bytes(new_id, name, email, age):
+    """테이블 파일 레이아웃의 users record 하나입니다(GLOSSARY.md의 데이터 파일)."""
+    body = new_id.to_bytes(8, "little", signed=True)
+    for text in (name, email):
+        encoded = text.encode("utf-8")
+        body += len(encoded).to_bytes(4, "little") + encoded
+    body += age.to_bytes(8, "little", signed=True)
+    return len(body).to_bytes(4, "little") + body
+
+
+def make_data_dir(records=()):
+    """records는 테이블 파일에 미리 써 둘 (name, email, age)들이고, ID는 1부터 붙습니다."""
     data_dir = tempfile.mkdtemp(prefix="mini-dbms-server-")
     with open(os.path.join(data_dir, "users.schema"), "w", encoding="utf-8") as f:
         f.write(USERS_SCHEMA)
-    open(os.path.join(data_dir, "users.tbl"), "wb").close()
+    with open(os.path.join(data_dir, "users.tbl"), "wb") as f:
+        f.write(b"".join(users_record_bytes(i, *record) for i, record in enumerate(records, 1)))
     return data_dir
 
 
@@ -47,8 +61,8 @@ def free_port():
 class Server:
     """with 문 안에서만 서버가 돕니다. 나갈 때 서버를 끄고 데이터 폴더를 지웁니다."""
 
-    def __init__(self, extra_args=(), preexec_fn=None):
-        self.data_dir = make_data_dir()
+    def __init__(self, extra_args=(), preexec_fn=None, records=()):
+        self.data_dir = make_data_dir(records)
         self.port = free_port()
         self.log = tempfile.TemporaryFile()
         self.process = subprocess.Popen(
@@ -103,6 +117,72 @@ class Server:
     def query(self, sql):
         status, _, body = self.request("POST", "/query", sql.encode("utf-8"))
         return status, body
+
+    def records(self):
+        status, body = self.query("SELECT * FROM users;")
+        assert status == 200, body
+        return body["records"]
+
+    def raw(self):
+        return RawClient(self.port)
+
+
+class RawClient:
+    """소켓 하나로 바이트를 그대로 보내고 응답을 하나씩 읽습니다. keep-alive와 잘못된
+    요청을 보내려고 http.client 대신 씁니다."""
+
+    def __init__(self, port):
+        self.sock = socket.create_connection((HOST, port), timeout=REQUEST_TIMEOUT)
+        self.buffer = b""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.sock.close()
+
+    def send(self, data):
+        self.sock.sendall(data)
+
+    def fill(self):
+        """더 받으면 True, 서버가 연결을 닫았으면 False입니다."""
+        try:
+            chunk = self.sock.recv(65536)
+        except ConnectionResetError:
+            return False
+        self.buffer += chunk
+        return bool(chunk)
+
+    def response(self):
+        """다음 응답 (상태 코드, 헤더 dict, 본문 JSON)입니다. 응답 전에 닫히면 None입니다."""
+        while b"\r\n\r\n" not in self.buffer:
+            if not self.fill():
+                assert self.buffer == b"", self.buffer
+                return None
+        head, self.buffer = self.buffer.split(b"\r\n\r\n", 1)
+        lines = head.decode("utf-8").split("\r\n")
+        headers = {k.strip().lower(): v.strip() for k, v in (line.split(":", 1) for line in lines[1:])}
+        length = int(headers["content-length"])
+        while len(self.buffer) < length:
+            assert self.fill(), "본문을 다 받기 전에 연결이 닫혔습니다"
+        body, self.buffer = self.buffer[:length], self.buffer[length:]
+        return int(lines[0].split()[1]), headers, json.loads(body)
+
+    def is_closed(self):
+        """서버가 더 보내지 않고 연결을 닫았는지 봅니다."""
+        return not self.fill() and self.buffer == b""
+
+
+def post(body, headers="Content-Length: {length}\r\n", version="HTTP/1.1"):
+    """POST /query 요청 바이트입니다. headers의 {length}는 본문 길이로 바뀝니다."""
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    head = f"POST /query {version}\r\nHost: test\r\n" + headers.format(length=len(body))
+    return head.encode("utf-8") + b"\r\n" + body
+
+
+def insert(name):
+    return f"INSERT INTO users VALUES ('{name}', 'e', 1);"
 
 
 def insert_returns_id_and_select_by_id_uses_index():
@@ -264,6 +344,132 @@ def bad_arguments_exit_2():
         assert b"usage" in proc.stderr, proc.stderr
 
 
+GUARDED_REQUESTS = [
+    (post(insert("a"), "Content-Length: abc\r\n"), 400, "invalid_body_length"),
+    (post(insert("a"), "Content-Length: -1\r\n"), 400, "invalid_body_length"),
+    (post(insert("a"), "Content-Length: {length}\r\nContent-Length: {length}\r\n"),
+     400, "invalid_body_length"),
+    (post(insert("a"), "Content-Length: {length}\r\nTransfer-Encoding: chunked\r\n"),
+     400, "invalid_body_length"),
+    (post(b"%x\r\n%s\r\n0\r\n\r\n" % (len(insert("a")), insert("a").encode()),
+          "Transfer-Encoding: chunked\r\n"), 411, "length_required"),
+    (post(insert("a"), ""), 411, "length_required"),
+    (post(b"", f"Content-Length: {BODY_MAX + 1}\r\n"), 413, "body_too_large"),
+    (post("INSERT INTO users VALUES ('a\0b', 'e', 1);"), 400, "invalid_sql_body"),
+    (post(b""), 400, "no_statement"),
+    (post(" \n\t "), 400, "no_statement"),
+    (post(b" " * BODY_MAX), 400, "no_statement"),
+]
+
+
+def guarded_requests_get_status_and_reason_without_running_sql():
+    with Server() as server:
+        for request, status, reason in GUARDED_REQUESTS:
+            with server.raw() as client:
+                client.send(request)
+                response = client.response()
+                assert response is not None, request[:120]
+                assert (response[0], response[2]["error"]) == (status, reason), (request[:120], response)
+        assert server.records() == []
+
+
+def header_over_8_kib_is_refused_and_server_keeps_serving():
+    pad = "X-Pad: " + "a" * (9 * 1024) + "\r\n"
+    with Server() as server:
+        with server.raw() as client:
+            client.send(post(insert("a"), pad + "Content-Length: {length}\r\n"))
+            response = client.response()
+            assert response is None or response[0] == 431, response
+        with server.raw() as client:
+            client.send(("POST /query HTTP/1.1\r\n" + pad).encode())
+            response = client.response()
+            assert response is None or response[0] == 431, response
+        with server.raw() as client:
+            client.send(post(insert("b"), "X-Pad: " + "a" * 7000 + "\r\nContent-Length: {length}\r\n"))
+            assert client.response()[0] == 200
+        assert [record[1] for record in server.records()] == ["b"]
+
+
+def body_shorter_than_declared_is_not_run():
+    with Server() as server:
+        with server.raw() as client:
+            body = insert("a").encode()
+            client.send(post(body, f"Content-Length: {len(body) + 10}\r\n"))
+        assert server.query(insert("b"))[0] == 200
+        assert [record[1] for record in server.records()] == ["b"]
+
+
+def result_over_10000_records_is_400_result_too_large():
+    records = [("n", "e", i) for i in range(1, 10001)] + [("last", "e", 10001)]
+    with Server(records=records) as server:
+        status, body = server.query("SELECT * FROM users;")
+        assert (status, body["error"]) == (400, "result_too_large"), (status, body)
+        status, body = server.query("SELECT id FROM users WHERE name = 'n';")
+        assert status == 200 and len(body["records"]) == 10000, status
+
+
+def full_queue_is_503_queue_full_without_running_sql():
+    with Server(extra_args=["--queue", "0"]) as server:
+        status, body = server.query(insert("a"))
+        assert (status, body["error"]) == (503, "queue_full"), body
+        assert os.path.getsize(os.path.join(server.data_dir, "users.tbl")) == 0
+
+
+def three_requests_on_one_connection_get_responses_in_order():
+    with Server() as server, server.raw() as client:
+        client.send(post(insert("a")) + post(insert("b")) + post(insert("c")))
+        for expected_id in (1, 2, 3):
+            status, headers, body = client.response()
+            assert (status, body) == (200, {"inserted": 1, "id": expected_id}), body
+            assert headers.get("connection") != "close", headers
+        client.send(post("SELECT name FROM users;"))
+        assert client.response()[2]["records"] == [["a"], ["b"], ["c"]]
+
+
+def connection_close_runs_no_later_sql_on_that_connection():
+    cases = [
+        (post(insert("a"), "Connection: close\r\nContent-Length: {length}\r\n"), True),
+        (post(insert("a"), version="HTTP/1.0"), True),
+        (post(insert("a"), "Connection: keep-alive\r\nContent-Length: {length}\r\n", "HTTP/1.0"), False),
+    ]
+    for first, closes in cases:
+        with Server() as server:
+            with server.raw() as client:
+                client.send(first + post(insert("b")))
+                status, headers, _ = client.response()
+                assert status == 200
+                if closes:
+                    assert headers.get("connection") == "close", headers
+                    assert client.is_closed()
+                else:
+                    assert client.response()[0] == 200
+            expected = ["a"] if closes else ["a", "b"]
+            assert [record[1] for record in server.records()] == expected, first
+
+
+def idle_connection_is_closed_after_timeout():
+    with Server(extra_args=["--idle-timeout", str(IDLE_TIMEOUT_MS)]) as server:
+        with server.raw() as client:
+            started = time.monotonic()
+            assert client.is_closed()
+            assert time.monotonic() - started >= IDLE_TIMEOUT_MS / 1000 * 0.9
+        with server.raw() as client:
+            client.send(post(insert("a")))
+            assert client.response()[0] == 200
+            assert client.is_closed()
+
+
+def insert_whose_client_left_is_still_stored():
+    with Server() as server:
+        with server.raw() as client:
+            client.send(post(insert("a")))
+        deadline = time.monotonic() + REQUEST_TIMEOUT
+        while not server.records():
+            assert time.monotonic() < deadline, "끊긴 연결의 INSERT가 저장되지 않았습니다"
+            time.sleep(0.02)
+        assert [record[1] for record in server.records()] == ["a"]
+
+
 TESTS = [
     ("[T163] INSERT는 200과 발급된 id를 받고, 같은 id의 SELECT는 INDEX로 그 record를 돌려준다",
      insert_returns_id_and_select_by_id_uses_index),
@@ -288,6 +494,26 @@ TESTS = [
     ("[T170] 기본 실행의 서버는 127.0.0.1이 아닌 주소로는 접속을 받지 않는다",
      default_server_refuses_non_loopback_address),
     ("잘못된 서버 인자는 사용법을 알리고 종료 코드 2로 끝난다", bad_arguments_exit_2),
+    ("[T203] 잘못된 본문 길이, chunked, 1 MiB 초과, NUL 바이트, 빈 본문은 상태 코드와 오류 이유로 "
+     "거절되고 SQL은 실행되지 않으며, 정확히 1 MiB인 본문은 받는다",
+     guarded_requests_get_status_and_reason_without_running_sql),
+    ("[T204] 8 KiB를 넘는 헤더는 431을 받거나 연결이 닫히고, 서버는 7 KiB 헤더의 다음 요청을 처리한다",
+     header_over_8_kib_is_refused_and_server_keeps_serving),
+    ("[T205] 선언한 길이보다 본문을 덜 보내고 끊은 요청은 실행되지 않는다",
+     body_shorter_than_declared_is_not_run),
+    ("[T206] 1만 1건을 돌려줄 SELECT는 400 result_too_large이고, 1만 건은 200이다",
+     result_over_10000_records_is_400_result_too_large),
+    ("[T207] 작업 대기열이 가득 차면 SQL을 실행하지 않고 503 queue_full로 바로 답한다",
+     full_queue_is_503_queue_full_without_running_sql),
+    ("[T208] 한 연결에 요청 세 개를 연달아 보내면 보낸 순서대로 응답을 받고 연결을 다시 쓴다",
+     three_requests_on_one_connection_get_responses_in_order),
+    ("[T209] Connection: close 요청과 keep-alive가 없는 HTTP/1.0 요청은 응답에 Connection: close를 "
+     "받고 같은 연결의 두 번째 SQL은 실행되지 않으며, keep-alive를 요청한 HTTP/1.0은 연결을 다시 쓴다",
+     connection_close_runs_no_later_sql_on_that_connection),
+    ("[T210] 아무것도 보내지 않는 연결과 응답 뒤 조용한 연결은 --idle-timeout 뒤 서버가 닫는다",
+     idle_connection_is_closed_after_timeout),
+    ("[T211] 응답을 받기 전에 연결을 끊은 INSERT는 파일에 남는다",
+     insert_whose_client_left_is_still_stored),
 ]
 
 

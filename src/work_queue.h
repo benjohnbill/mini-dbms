@@ -10,8 +10,9 @@
 
 struct work_queue;
 
-/* 작업 스레드 thread_count개와 칸 capacity개의 대기열을 만듭니다. 두 수는
-   1 이상입니다. 실행 중인 작업은 칸을 쓰지 않습니다. 실패하면 NULL입니다. */
+/* 작업 스레드 thread_count개와 칸 capacity개의 대기열을 만듭니다.
+   thread_count는 1 이상입니다. capacity가 0이면 모든 작업을 거절합니다.
+   실행 중인 작업은 칸을 쓰지 않습니다. 실패하면 NULL입니다. */
 struct work_queue *work_queue_create(size_t thread_count, size_t capacity,
                                      void (*handler)(void *job, void *context),
                                      void *context);

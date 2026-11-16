@@ -32,9 +32,11 @@ struct work_queue *work_queue_create(size_t thread_count, size_t capacity,
     if (queue == NULL) {
         return NULL;
     }
+    /* 칸이 0인 대기열은 모든 작업을 거절합니다. calloc(0)은 NULL일 수
+       있지만 그 배열은 쓰이지 않습니다. */
     queue->jobs = calloc(capacity, sizeof(*queue->jobs));
     queue->threads = calloc(thread_count, sizeof(*queue->threads));
-    if (queue->jobs == NULL || queue->threads == NULL ||
+    if ((queue->jobs == NULL && capacity > 0) || queue->threads == NULL ||
         pthread_mutex_init(&queue->mutex, NULL) != 0) {
         free(queue->jobs);
         free(queue->threads);
