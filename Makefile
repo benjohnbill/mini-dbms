@@ -15,7 +15,7 @@ LDFLAGS  := -fsanitize=address,undefined
 BUILD    := build
 
 # main이 있는 파일입니다. 나머지 src/*.c는 DB 엔진이며, CLI와 테스트가 함께 링크합니다.
-MAIN_SRCS := src/cli.c
+MAIN_SRCS := src/cli.c src/bench.c
 LIB_SRCS  := $(filter-out $(MAIN_SRCS),$(wildcard src/*.c))
 LIB_OBJS  := $(LIB_SRCS:src/%.c=$(BUILD)/%.o)
 
@@ -29,7 +29,7 @@ FUNCTIONAL_TESTS := $(wildcard tests/functional/*_test.py)
 
 CLI      := $(BUILD)/mini-dbms
 
-.PHONY: all test functional verify lint format clean
+.PHONY: all test functional verify lint format clean bench bench-smoke
 
 all: $(CLI) $(TEST_BINS)
 
@@ -54,9 +54,40 @@ test: $(TEST_BINS)
 functional: $(CLI)
 	@set -e; for t in $(FUNCTIONAL_TESTS); do echo "== $$t"; python3 -B $$t $(CLI); done
 
-verify: $(CLI) test functional
+verify: $(CLI) test functional bench-smoke
 	python3 scripts/check-ids.py
 	python3 scripts/convention.py lint
+
+# make bench: 100만 record를 생성해 -O2 CLI로 넣고, INDEX 대 SCAN과 노드 크기를
+# 잽니다. 측정용 실행 파일은 sanitizer를 끄고 -O2로 따로 만듭니다. 노드 크기마다
+# -DBPTREE_NODE_KEYS=N으로 엔진을 다시 컴파일합니다(bench-N).
+# bench-smoke는 같은 절차를 작은 record 수로 실행해 make verify가 빠르게 끝나게 합니다.
+BENCH_DIR        := $(BUILD)/bench
+BENCH_CFLAGS     := -std=c11 -Wall -Wextra -Werror -O2
+BENCH_NODE_SIZES := 16 32 64 128
+BENCH_RECORDS    ?= 1000000
+BENCH_SEED       ?= 20261116
+BENCH_SMOKE_RECORDS := 2000
+BENCH_BINS := $(BENCH_DIR)/mini-dbms $(BENCH_DIR)/bench \
+              $(BENCH_NODE_SIZES:%=$(BENCH_DIR)/bench-%)
+
+$(BENCH_DIR)/mini-dbms: src/cli.c $(LIB_SRCS) $(wildcard src/*.h) | $(BENCH_DIR)
+	$(CC) $(CPPFLAGS) $(BENCH_CFLAGS) src/cli.c $(LIB_SRCS) -o $@
+
+$(BENCH_DIR)/bench: src/bench.c $(LIB_SRCS) $(wildcard src/*.h) | $(BENCH_DIR)
+	$(CC) $(CPPFLAGS) $(BENCH_CFLAGS) src/bench.c $(LIB_SRCS) -o $@
+
+$(BENCH_DIR)/bench-%: src/bench.c $(LIB_SRCS) $(wildcard src/*.h) | $(BENCH_DIR)
+	$(CC) $(CPPFLAGS) -DBPTREE_NODE_KEYS=$* $(BENCH_CFLAGS) src/bench.c $(LIB_SRCS) -o $@
+
+$(BENCH_DIR):
+	mkdir -p $@
+
+bench: $(BENCH_BINS)
+	python3 -B scripts/bench.py $(BENCH_DIR) $(BENCH_RECORDS) $(BENCH_SEED) $(BENCH_NODE_SIZES)
+
+bench-smoke: $(BENCH_BINS)
+	@python3 -B scripts/bench.py $(BENCH_DIR) $(BENCH_SMOKE_RECORDS) $(BENCH_SEED) $(BENCH_NODE_SIZES) > /dev/null
 
 # 코드 규칙(CONVENTION.md의 코드 절)입니다. lint는 위반을 출력하고 실패로 끝나며,
 # format은 모양 위반을 고치고 바꾼 줄을 보여 줍니다.
