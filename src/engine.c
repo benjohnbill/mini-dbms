@@ -24,6 +24,7 @@
    table_locks[i]는 tables[i]의 쓰기 우선 잠금입니다. 테이블 목록은 시작
    뒤에 바뀌지 않으므로 목록 자체에는 잠금이 없습니다. */
 struct engine {
+    struct engine_options options;
     int lock_fd;
     struct table **tables;
     size_t table_count;
@@ -38,7 +39,7 @@ static int engine_load_tables(struct engine *engine, const char *data_dir,
 static int engine_add_table(struct engine *engine, struct table *table);
 static int engine_init_table_locks(struct engine *engine, char *error,
                                    size_t error_size);
-static void execute_locked(struct table *table, struct rwlock *lock,
+static void execute_locked(const struct engine *engine, size_t table_index,
                            const struct statement *statement,
                            struct engine_result *result);
 static void result_fail(struct engine_result *result,
@@ -52,8 +53,15 @@ static void execute_insert(struct table *table,
                            const struct statement *statement,
                            struct engine_result *result);
 static void execute_select(struct table *table,
+                           const struct engine_options *options,
                            const struct statement *statement,
                            struct engine_result *result);
+static bool result_is_over_limit(const struct engine_result *result,
+                                 const struct engine_options *options,
+                                 size_t result_bytes);
+static size_t record_bytes_get(const struct engine_result *result,
+                               size_t record_index);
+static void result_records_clear(struct engine_result *result);
 static bool table_find_field(const struct table *table, const char *name,
                              size_t *source);
 static int where_check(struct engine_result *result, const struct table *table,
@@ -79,10 +87,12 @@ struct engine *engine_create(const char *data_dir,
 {
     struct engine *engine = calloc(1, sizeof(*engine));
 
-    (void)options;
     if (engine == NULL) {
         snprintf(error, error_size, "메모리가 부족합니다");
         return NULL;
+    }
+    if (options != NULL) {
+        engine->options = *options;
     }
     engine->lock_fd = -1;
     /* 다른 프로세스가 같은 파일을 쓰는 중에 읽지 않도록, 스키마와 테이블
@@ -133,8 +143,7 @@ struct engine_result *engine_execute(struct engine *engine, const char *sql,
     result->error_line = statement->line;
     result->error_byte_in_line = statement->byte_in_line;
     if (engine_find_table(engine, statement->table, &table_index)) {
-        execute_locked(engine->tables[table_index],
-                       &engine->table_locks[table_index], statement, result);
+        execute_locked(engine, table_index, statement, result);
     } else {
         result_fail(result, ENGINE_REASON_NO_TABLE, "없는 테이블입니다: %s",
                     statement->table);
@@ -152,13 +161,8 @@ void engine_result_destroy(struct engine_result *result)
     for (size_t i = 0; i < result->field_count; i++) {
         free(result->field_names[i]);
     }
-    for (size_t i = 0; i < result->record_count * result->field_count; i++) {
-        if (result->values[i].type == VALUE_TEXT) {
-            free((char *)result->values[i].text);
-        }
-    }
     free(result->field_names);
-    free(result->values);
+    result_records_clear(result);
     free(result);
 }
 
@@ -288,10 +292,12 @@ static int engine_init_table_locks(struct engine *engine, char *error,
    되돌리기가 모두 이 쓰기 잠금 안에 들어가므로, 그 아래 함수는 잠금을 다시
    잡지 않습니다. available도 되돌리기가 쓰기 잠금 안에서 바꾸므로 잠금
    안에서 읽습니다. */
-static void execute_locked(struct table *table, struct rwlock *lock,
+static void execute_locked(const struct engine *engine, size_t table_index,
                            const struct statement *statement,
                            struct engine_result *result)
 {
+    struct table *table = engine->tables[table_index];
+    struct rwlock *lock = &engine->table_locks[table_index];
     bool writes = statement->kind == STATEMENT_INSERT;
 
     if (writes) {
@@ -307,7 +313,7 @@ static void execute_locked(struct table *table, struct rwlock *lock,
     } else if (writes) {
         execute_insert(table, statement, result);
     } else {
-        execute_select(table, statement, result);
+        execute_select(table, &engine->options, statement, result);
     }
     if (writes) {
         rwlock_write_unlock(lock);
@@ -415,9 +421,11 @@ insert_error_reason(enum table_insert_status insert_status)
 }
 
 static void execute_select(struct table *table,
+                           const struct engine_options *options,
                            const struct statement *statement,
                            struct engine_result *result)
 {
+    size_t result_bytes = 0;
     size_t source_count = statement->field_count == 0 ? table->field_count + 1
                                                       : statement->field_count;
     size_t *sources = calloc(source_count, sizeof(*sources));
@@ -464,9 +472,22 @@ static void execute_select(struct table *table,
             status = -1;
             break;
         }
+        result_bytes += record_bytes_get(result, result->record_count - 1);
+        if (result_is_over_limit(result, options, result_bytes)) {
+            break;
+        }
     }
     iterator->destroy(iterator);
     free(sources);
+    /* 상한을 넘으면 모으기를 멈추고, 모은 record를 해제해 큰 결과가 메모리에
+       남지 않게 합니다. */
+    if (status == 1) {
+        result_records_clear(result);
+        result_fail(result, ENGINE_REASON_RESULT_TOO_LARGE,
+                    "결과가 상한(record %zu건, %zu바이트)을 넘습니다",
+                    options->max_records, options->max_bytes);
+        return;
+    }
     if (status != 0) {
         result_fail(result, ENGINE_REASON_STORAGE_ERROR,
                     "%s.tbl을 읽지 못했습니다", table->name);
@@ -626,4 +647,42 @@ static int result_add_record(struct engine_result *result,
         text[source.text_len] = '\0';
     }
     return 0;
+}
+
+/* 상한 0은 그 상한을 두지 않는다는 뜻입니다. */
+static bool result_is_over_limit(const struct engine_result *result,
+                                 const struct engine_options *options,
+                                 size_t result_bytes)
+{
+    return (options->max_records != 0 &&
+            result->record_count > options->max_records) ||
+           (options->max_bytes != 0 && result_bytes > options->max_bytes);
+}
+
+/* 결과 상한이 세는 record 하나의 바이트입니다. INT는 8, TEXT는 바이트
+   길이입니다. */
+static size_t record_bytes_get(const struct engine_result *result,
+                               size_t record_index)
+{
+    const struct value *values =
+        &result->values[record_index * result->field_count];
+    size_t record_bytes = 0;
+
+    for (size_t i = 0; i < result->field_count; i++) {
+        record_bytes +=
+            values[i].type == VALUE_TEXT ? values[i].text_len : sizeof(int64_t);
+    }
+    return record_bytes;
+}
+
+static void result_records_clear(struct engine_result *result)
+{
+    for (size_t i = 0; i < result->record_count * result->field_count; i++) {
+        if (result->values[i].type == VALUE_TEXT) {
+            free((char *)result->values[i].text);
+        }
+    }
+    free(result->values);
+    result->values = NULL;
+    result->record_count = 0;
 }

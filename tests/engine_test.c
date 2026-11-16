@@ -68,6 +68,50 @@ static struct engine *engine_reopen(void)
 
 static struct engine_result *execute_one(struct engine *engine,
                                          const char *sql);
+static struct engine *limited_engine_create(size_t max_records,
+                                            size_t max_bytes);
+
+static void select_over_record_limit_is_result_too_large_test(void)
+{
+    struct engine *engine = limited_engine_create(3, 0);
+    struct engine_result *result = execute_one(engine, "SELECT * FROM users;");
+
+    TEST_CHECK(result->status == ENGINE_ERROR);
+    TEST_CHECK(result->error_reason == ENGINE_REASON_RESULT_TOO_LARGE);
+    TEST_CHECK(result->record_count == 0);
+    TEST_CHECK(result->values == NULL);
+    engine_result_destroy(result);
+
+    result = execute_one(engine, "SELECT name FROM users WHERE age = 1;");
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_CHECK(result->record_count == 3);
+    engine_result_destroy(result);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
+static void select_over_byte_limit_is_result_too_large_test(void)
+{
+    /* record 하나는 id 8, 'kim' 3, 'k@x' 3, age 8로 22바이트입니다. */
+    struct engine *engine = limited_engine_create(0, 50);
+    struct engine_result *result =
+        execute_one(engine, "SELECT * FROM users WHERE age = 1;");
+
+    TEST_CHECK(result->status == ENGINE_ERROR);
+    TEST_CHECK(result->error_reason == ENGINE_REASON_RESULT_TOO_LARGE);
+    TEST_CHECK(result->record_count == 0);
+    engine_result_destroy(result);
+
+    result = execute_one(engine, "SELECT * FROM users WHERE age = 2;");
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_CHECK(result->record_count == 1);
+    engine_result_destroy(result);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
 static void check_text(const struct value *value, const char *expected);
 
 static void insert_returns_id_and_select_returns_record_test(void)
@@ -1763,6 +1807,12 @@ TEST_LIST = {
     {"[T160] API 모드에서 문장 뒤에 다른 문장이 있으면 multiple_statements "
      "오류이고 첫 문장도 실행하지 않는다",
      api_mode_rejects_second_statement_before_running_test},
+    {"[T200] 결과 상한이 record 3건인 엔진에서 4건을 돌려줄 SELECT는 "
+     "result_too_large이고 모은 record를 남기지 않으며, 3건은 돌려준다",
+     select_over_record_limit_is_result_too_large_test},
+    {"[T201] 결과 상한이 50바이트인 엔진에서 22바이트 record 세 건은 "
+     "result_too_large이고 한 건은 돌려준다",
+     select_over_byte_limit_is_result_too_large_test},
     {NULL, NULL},
 };
 
@@ -1816,6 +1866,30 @@ static struct engine *users_engine_create(void)
     write_file("users.schema", "name TEXT\nemail TEXT\nage INT\n");
     write_file("users.tbl", "");
     engine = engine_create(data_dir, NULL, error, sizeof(error));
+    TEST_ASSERT(engine != NULL);
+    TEST_MSG("error: %s", error);
+
+    return engine;
+}
+
+/* users에 age 1인 record 세 건과 age 2인 record 한 건을 넣은 뒤, 결과 상한을
+   준 엔진으로 다시 엽니다. 0은 그 상한을 두지 않는다는 뜻입니다. */
+static struct engine *limited_engine_create(size_t max_records,
+                                            size_t max_bytes)
+{
+    struct engine_options options = {.max_records = max_records,
+                                     .max_bytes = max_bytes};
+    char error[ENGINE_ERROR_MAX] = "";
+    struct engine *engine = users_engine_create();
+
+    for (int i = 0; i < 3; i++) {
+        engine_result_destroy(
+            execute_one(engine, "INSERT INTO users VALUES ('kim', 'k@x', 1);"));
+    }
+    engine_result_destroy(
+        execute_one(engine, "INSERT INTO users VALUES ('kim', 'k@x', 2);"));
+    engine_destroy(engine);
+    engine = engine_create(data_dir, &options, error, sizeof(error));
     TEST_ASSERT(engine != NULL);
     TEST_MSG("error: %s", error);
 

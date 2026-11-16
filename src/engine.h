@@ -12,10 +12,13 @@
 
 struct engine;
 
-/* 지금은 칸이 없습니다. 결과 상한 같은 옵션이 여기에 더해집니다.
-   NULL을 넘기면 기본값을 씁니다. */
+/* 엔진을 만들 때 정하는 옵션입니다. NULL을 넘기면 모든 칸이 0입니다.
+   결과 상한은 SELECT 하나가 모을 수 있는 record 수와 값의 누적 바이트(INT는
+   8, TEXT는 바이트 길이)입니다. 넘으면 ENGINE_REASON_RESULT_TOO_LARGE로
+   끝납니다. 0은 상한을 두지 않는다는 뜻이고, CLI는 0을 씁니다. */
 struct engine_options {
-    int reserved;
+    size_t max_records;
+    size_t max_bytes;
 };
 
 enum engine_status {
@@ -39,6 +42,7 @@ enum engine_error_reason {
     ENGINE_REASON_STORAGE_ERROR, /* 테이블 파일 읽기와 쓰기 */
     ENGINE_REASON_TABLE_UNAVAILABLE,
     ENGINE_REASON_MULTIPLE_STATEMENTS, /* API 모드에서 문장 뒤에 다른 글자 */
+    ENGINE_REASON_RESULT_TOO_LARGE,    /* SELECT 결과가 결과 상한을 넘음 */
 };
 
 enum engine_statement_kind {
