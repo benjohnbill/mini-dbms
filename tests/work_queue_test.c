@@ -99,6 +99,46 @@ static void destroy_runs_queued_jobs_first_test(void)
     alarm(0);
 }
 
+static int discarded[RAN_MAX];
+static int discarded_count;
+
+static void job_discard(void *job)
+{
+    if (discarded_count < RAN_MAX) {
+        discarded[discarded_count++] = *(int *)job;
+    }
+}
+
+static void discard_drops_only_jobs_not_yet_started_test(void)
+{
+    static int jobs[] = {1, 2, 3};
+    struct probe probe;
+    struct work_queue *queue;
+
+    alarm(HANG_LIMIT_SECONDS);
+    probe_init(&probe);
+    discarded_count = 0;
+    queue = work_queue_create(1, 2, held_job_run, &probe);
+    TEST_ASSERT(queue != NULL);
+
+    /* 작업 1을 스레드가 쥐고 멈춘 동안 작업 2, 3은 대기열에만 있습니다. */
+    TEST_CHECK(work_queue_submit(queue, &jobs[0]));
+    probe_wait_started(&probe, 1);
+    TEST_CHECK(work_queue_submit(queue, &jobs[1]));
+    TEST_CHECK(work_queue_submit(queue, &jobs[2]));
+    TEST_CHECK(work_queue_discard(queue, job_discard) == 2);
+    TEST_ASSERT(discarded_count == 2);
+    TEST_CHECK(discarded[0] == 2);
+    TEST_CHECK(discarded[1] == 3);
+
+    probe_release(&probe);
+    work_queue_destroy(queue);
+    TEST_ASSERT(probe.ran_count == 1);
+    TEST_CHECK(probe.ran[0] == 1);
+    probe_destroy(&probe);
+    alarm(0);
+}
+
 static void zero_capacity_queue_rejects_every_job_test(void)
 {
     static int job = 1;
@@ -125,6 +165,9 @@ TEST_LIST = {
      destroy_runs_queued_jobs_first_test},
     {"칸이 0인 대기열은 모든 작업을 거절하고 아무것도 실행하지 않는다",
      zero_capacity_queue_rejects_every_job_test},
+    {"[T220] 대기열을 비우면 아직 시작하지 않은 작업만 넣은 순서로 버리고, "
+     "실행 중인 작업은 끝까지 실행된다",
+     discard_drops_only_jobs_not_yet_started_test},
     {NULL, NULL},
 };
 

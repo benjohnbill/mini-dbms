@@ -75,6 +75,22 @@ bool work_queue_submit(struct work_queue *queue, void *job)
     return accepted;
 }
 
+size_t work_queue_discard(struct work_queue *queue, void (*discard)(void *job))
+{
+    size_t discarded_count;
+
+    pthread_mutex_lock(&queue->mutex);
+    discarded_count = queue->job_count;
+    for (size_t i = 0; i < discarded_count; i++) {
+        discard(queue->jobs[(queue->head + i) % queue->capacity]);
+    }
+    queue->head = 0;
+    queue->job_count = 0;
+    pthread_mutex_unlock(&queue->mutex);
+
+    return discarded_count;
+}
+
 void work_queue_destroy(struct work_queue *queue)
 {
     if (queue == NULL) {
