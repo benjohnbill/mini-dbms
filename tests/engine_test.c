@@ -567,6 +567,156 @@ static void failed_allocation_keeps_file_and_id_test(void)
     data_dir_remove();
 }
 
+/* 테이블 파일 바이트를 만듭니다. 모든 정수는 리틀 엔디언입니다. */
+static size_t put_le(unsigned char *bytes, uint64_t number, size_t width)
+{
+    for (size_t i = 0; i < width; i++) {
+        bytes[i] = (unsigned char)(number >> (8 * i));
+    }
+    return width;
+}
+
+/* name TEXT 스키마의 record 하나를 bytes에 쓰고 쓴 바이트 수를 돌려줍니다.
+   body_len과 text_len은 일부러 내용과 다르게 줄 수 있습니다. */
+static size_t text_record_put(unsigned char *bytes, uint32_t body_len,
+                              int64_t new_id, uint32_t text_len,
+                              const char *text)
+{
+    size_t size = put_le(bytes, body_len, 4);
+
+    size += put_le(bytes + size, (uint64_t)new_id, 8);
+    size += put_le(bytes + size, text_len, 4);
+    memcpy(bytes + size, text, strlen(text));
+    return size + strlen(text);
+}
+
+static void table_file_write(const char *name, const unsigned char *bytes,
+                             size_t size)
+{
+    char path[PATH_MAX_LEN];
+    FILE *file;
+
+    snprintf(path, sizeof(path), "%s/%s", data_dir, name);
+    file = fopen(path, "wb");
+    TEST_ASSERT(file != NULL);
+    TEST_ASSERT(fwrite(bytes, 1, size, file) == size);
+    fclose(file);
+}
+
+/* users(name TEXT) 테이블 파일을 bytes로 두고 엔진을 만들면 실패하고,
+   메시지에 파일 이름, 바이트 위치, record 번호, 종류가 있고, 파일이 그대로인지
+   확인합니다. */
+static void broken_table_check(const unsigned char *bytes, size_t size,
+                               const char *position, const char *record_no,
+                               const char *kind)
+{
+    char error[ENGINE_ERROR_MAX] = "";
+    char path[PATH_MAX_LEN];
+    unsigned char after[256];
+    struct engine *engine;
+    FILE *file;
+    size_t after_size;
+
+    TEST_ASSERT(size <= sizeof(after));
+    data_dir_create();
+    write_file("users.schema", "name TEXT\n");
+    table_file_write("users.tbl", bytes, size);
+    engine = engine_create(data_dir, NULL, error, sizeof(error));
+    TEST_CHECK(engine == NULL);
+    TEST_CHECK(strstr(error, "users.tbl") != NULL);
+    TEST_CHECK(strstr(error, position) != NULL);
+    TEST_CHECK(strstr(error, record_no) != NULL);
+    TEST_CHECK(strstr(error, kind) != NULL);
+    TEST_MSG("expected %s, %s, %s; error: %s", position, record_no, kind,
+             error);
+    engine_destroy(engine);
+    snprintf(path, sizeof(path), "%s/users.tbl", data_dir);
+    file = fopen(path, "rb");
+    TEST_ASSERT(file != NULL);
+    after_size = fread(after, 1, sizeof(after), file);
+    fclose(file);
+    TEST_CHECK(after_size == size && memcmp(after, bytes, size) == 0);
+    data_dir_remove();
+}
+
+static void length_cut_in_last_record_is_truncation_test(void)
+{
+    unsigned char bytes[64];
+    size_t size = text_record_put(bytes, 15, 1, 3, "abc");
+
+    for (size_t cut = 1; cut <= 3; cut++) {
+        put_le(bytes + size, 15, 4);
+        broken_table_check(bytes, size + cut, "19번째 바이트", "record(2번째)",
+                           "잘림");
+    }
+}
+
+static void body_cut_in_last_record_is_truncation_test(void)
+{
+    /* 둘째 record의 본문을 0바이트, id 중간, 길이 칸 중간, TEXT 중간에서
+       자릅니다. */
+    const size_t body_cuts[] = {0, 5, 10, 13};
+    unsigned char bytes[64];
+    size_t size = text_record_put(bytes, 15, 1, 3, "abc");
+
+    text_record_put(bytes + size, 15, 2, 3, "xyz");
+    for (size_t i = 0; i < sizeof(body_cuts) / sizeof(body_cuts[0]); i++) {
+        broken_table_check(bytes, size + 4 + body_cuts[i], "19번째 바이트",
+                           "record(2번째)", "잘림");
+    }
+}
+
+static void middle_length_past_file_end_is_corruption_test(void)
+{
+    unsigned char bytes[64];
+    size_t size = text_record_put(bytes, 115, 1, 3, "abc");
+
+    size += text_record_put(bytes + size, 15, 2, 3, "xyz");
+    broken_table_check(bytes, size, "0번째 바이트", "record(1번째)", "손상");
+}
+
+static void zero_length_record_is_corruption_test(void)
+{
+    unsigned char bytes[64] = {0};
+    size_t size = text_record_put(bytes, 15, 1, 3, "abc");
+
+    broken_table_check(bytes, size + 20, "19번째 바이트", "record(2번째)",
+                       "손상");
+}
+
+static void fields_not_matching_body_len_is_corruption_test(void)
+{
+    unsigned char bytes[64];
+    size_t size;
+
+    /* TEXT 길이 2: field가 본문 15바이트 중 14바이트만 씁니다. */
+    size = text_record_put(bytes, 15, 1, 2, "abc");
+    size += text_record_put(bytes + size, 15, 2, 3, "xyz");
+    broken_table_check(bytes, size, "0번째 바이트", "record(1번째)", "손상");
+
+    /* TEXT 길이 4: field가 본문 15바이트보다 1바이트 더 씁니다. */
+    size = text_record_put(bytes, 15, 1, 4, "abc");
+    size += text_record_put(bytes + size, 15, 2, 3, "xyz");
+    broken_table_check(bytes, size, "0번째 바이트", "record(1번째)", "손상");
+}
+
+static void id_not_above_previous_is_corruption_test(void)
+{
+    const int64_t second_ids[] = {1, 0, -3};
+    unsigned char bytes[64];
+    size_t size;
+
+    for (size_t i = 0; i < sizeof(second_ids) / sizeof(second_ids[0]); i++) {
+        size = text_record_put(bytes, 15, 1, 3, "abc");
+        size += text_record_put(bytes + size, 15, second_ids[i], 3, "xyz");
+        broken_table_check(bytes, size, "19번째 바이트", "record(2번째)",
+                           "손상");
+    }
+    /* 첫 id는 1 이상이어야 합니다. */
+    size = text_record_put(bytes, 15, 0, 3, "abc");
+    broken_table_check(bytes, size, "0번째 바이트", "record(1번째)", "손상");
+}
+
 TEST_LIST = {
     {"[T6] INSERT는 ID 1을 받고 SELECT *가 그 record를 돌려준다",
      insert_returns_id_and_select_returns_record_test},
@@ -581,7 +731,8 @@ TEST_LIST = {
      broken_statement_returns_error_test},
     {"엔진을 다시 만들어도 record가 남고 ID는 가장 큰 ID 다음부터 이어진다",
      restart_keeps_records_and_continues_ids_test},
-    {"[T20] 두 테이블에 번갈아 INSERT하면 테이블마다 ID가 1부터 따로 오른다",
+    {"[T20] 두 테이블에 번갈아 INSERT하면 테이블마다 ID가 1부터 따로 "
+     "오른다",
      each_table_counts_ids_from_one_test},
     {"잠긴 데이터 폴더로 만든 두 번째 엔진은 실패하고, 첫 엔진을 해제하면 "
      "만들어진다",
@@ -589,7 +740,8 @@ TEST_LIST = {
     {"[T21] 형식이 틀린 줄, 같은 field 이름, 지원하지 않는 타입, 스키마의 "
      "id는 엔진 만들기를 멈추고, 형식 오류는 줄 번호를 알린다",
      bad_schema_stops_engine_create_test},
-    {"[T22] 테이블 파일이 없는 테이블이 있으면 엔진 만들기가 실패하고 파일을 "
+    {"[T22] 테이블 파일이 없는 테이블이 있으면 엔진 만들기가 실패하고 "
+     "파일을 "
      "만들지 않는다",
      missing_table_file_stops_engine_create_test},
     {"다음 ID가 INT 최댓값을 넘으면 INSERT는 오류이고 테이블 파일이 "
@@ -603,7 +755,8 @@ TEST_LIST = {
      failed_rollback_stops_table_test},
     {"[T82] 한 테이블이 멈춰도 다른 테이블의 INSERT와 SELECT는 성공한다",
      stopped_table_leaves_other_tables_working_test},
-    {"[T83] 쓰기가 실패하고 되돌린 뒤의 SELECT는 재시작 전후 모두 실패 전과 "
+    {"[T83] 쓰기가 실패하고 되돌린 뒤의 SELECT는 재시작 전후 모두 실패 "
+     "전과 "
      "같은 record를 돌려준다",
      select_after_rollback_returns_records_before_failure_test},
     {"[T84] 일부만 쓰이거나 EINTR로 끊긴 쓰기는 이어 써서 완전한 record "
@@ -615,6 +768,23 @@ TEST_LIST = {
     {"[T86] record 버퍼 할당이 실패하면 INSERT는 out_of_memory이고 테이블 "
      "파일과 ID가 그대로다",
      failed_allocation_keeps_file_and_id_test},
+    {"[T60] 마지막 길이 칸 중간(1~3바이트)에서 끝난 테이블 파일은 잘림으로 "
+     "엔진 만들기를 멈추고 파일을 고치지 않는다",
+     length_cut_in_last_record_is_truncation_test},
+    {"[T61] 마지막 record의 본문 중간에서 끝난 테이블 파일은 잘림으로 엔진 "
+     "만들기를 멈춘다",
+     body_cut_in_last_record_is_truncation_test},
+    {"[T62] 길이 칸이 파일 끝을 넘지만 field는 다 읽히는 중간 record는 "
+     "잘림이 "
+     "아니라 손상이다",
+     middle_length_past_file_end_is_corruption_test},
+    {"[T63] 길이가 0인 record(0으로 채워진 끝)는 손상이다",
+     zero_length_record_is_corruption_test},
+    {"[T64] field가 본문 길이보다 적게 또는 많게 쓰는 record는 손상이다",
+     fields_not_matching_body_len_is_corruption_test},
+    {"[T65] 앞 record의 id보다 작거나 같은 id와 1보다 작은 첫 id는 "
+     "손상이다",
+     id_not_above_previous_is_corruption_test},
     {NULL, NULL},
 };
 
