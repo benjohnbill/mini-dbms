@@ -4,6 +4,7 @@
 사용법: python3 tests/functional/cli_test.py <CLI 경로>
 """
 
+import fcntl
 import os
 import shutil
 import subprocess
@@ -138,6 +139,68 @@ def sql_error_exits_1():
         shutil.rmtree(data_dir)
 
 
+def rerun_keeps_records_and_next_id_is_4():
+    data_dir = make_data_dir()
+    try:
+        proc = run_sql(data_dir,
+                       "INSERT INTO users VALUES ('a', 'a@x', 1);\n"
+                       "INSERT INTO users VALUES ('b', 'b@x', 2);\n"
+                       "INSERT INTO users VALUES ('c', 'c@x', 3);\n")
+        assert proc.returncode == 0, proc.stderr
+        proc = run_sql(data_dir,
+                       "INSERT INTO users VALUES ('d', 'd@x', 4);\n"
+                       "SELECT * FROM users;\n")
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == (b"id\tname\temail\tage\n"
+                               b"1\ta\ta@x\t1\n"
+                               b"2\tb\tb@x\t2\n"
+                               b"3\tc\tc@x\t3\n"
+                               b"4\td\td@x\t4\n"), proc.stdout
+    finally:
+        shutil.rmtree(data_dir)
+
+
+def locked_data_dir_exits_1_until_lock_is_released():
+    data_dir = make_data_dir()
+    try:
+        # 첫 프로세스 자리를 테스트가 맡습니다. 엔진과 같은 잠금 파일에 같은 flock을 쥡니다.
+        with open(os.path.join(data_dir, ".lock"), "w") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            proc = run_sql(data_dir, "SELECT * FROM users;")
+            assert proc.returncode == 1, proc.returncode
+            assert b"in use" in proc.stderr, proc.stderr
+        proc = run_sql(data_dir, "SELECT * FROM users;")
+        assert proc.returncode == 0, proc.stderr
+    finally:
+        shutil.rmtree(data_dir)
+
+
+def dump_prints_same_tsv_as_select_star():
+    data_dir = make_data_dir()
+    try:
+        proc = run_sql(data_dir,
+                       "INSERT INTO users VALUES ('a\tb', 'O''Brien', 1);\n"
+                       "INSERT INTO users VALUES ('c', 'd\ne', -2);\n")
+        assert proc.returncode == 0, proc.stderr
+        select = run_sql(data_dir, "SELECT * FROM users;")
+        dump = run_cli(["--data", data_dir, "dump", "users"])
+        assert dump.returncode == 0, dump.stderr
+        assert dump.stdout == select.stdout, (dump.stdout, select.stdout)
+        assert dump.stdout.count(b"\n") == 3, dump.stdout
+    finally:
+        shutil.rmtree(data_dir)
+
+
+def dump_of_unknown_table_exits_1():
+    data_dir = make_data_dir()
+    try:
+        proc = run_cli(["--data", data_dir, "dump", "nobody"])
+        assert proc.returncode == 1, proc.returncode
+        assert proc.stderr
+    finally:
+        shutil.rmtree(data_dir)
+
+
 TESTS = [
     ("[T1] 빈 데이터 폴더에서 INSERT 두 개와 SELECT *는 ID 1, 2인 record를 TSV로 출력한다",
      insert_two_and_select_prints_ids_1_and_2),
@@ -151,6 +214,13 @@ TESTS = [
     ("[T4] 잘못된 CLI 인자는 종료 코드 2로 끝난다", bad_cli_arguments_exit_2),
     ("[T5] 열 수 없는 SQL 파일은 종료 코드 1로 끝난다", unreadable_sql_file_exits_1),
     ("SQL 실행 오류는 종료 코드 1로 끝난다", sql_error_exits_1),
+    ("INSERT 세 개 뒤 CLI를 다시 실행하면 세 record가 조회되고 다음 INSERT는 ID 4를 받는다",
+     rerun_keeps_records_and_next_id_is_4),
+    ("[T23] 다른 프로세스가 데이터 폴더를 잠근 동안 CLI는 종료 코드 1로 끝나고, 잠금이 풀리면 실행된다",
+     locked_data_dir_exits_1_until_lock_is_released),
+    ("[T24] dump는 같은 테이블의 SELECT *와 같은 TSV를 출력한다",
+     dump_prints_same_tsv_as_select_star),
+    ("없는 테이블의 dump는 종료 코드 1로 끝난다", dump_of_unknown_table_exits_1),
 ]
 
 
