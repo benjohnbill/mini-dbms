@@ -155,6 +155,94 @@ static void broken_statement_returns_error_test(void)
     data_dir_remove();
 }
 
+static void keywords_ignore_case_and_table_names_do_not_test(void)
+{
+    struct engine *engine = users_engine_create();
+    const char *same_sql[] = {
+        "select * from users;",
+        "SELECT * FROM users;",
+        "SeLeCt * FrOm users;",
+    };
+    struct engine_result *result;
+
+    for (size_t i = 0; i < sizeof(same_sql) / sizeof(same_sql[0]); i++) {
+        result = execute_one(engine, same_sql[i]);
+        TEST_CHECK(result->status == ENGINE_OK);
+        TEST_MSG("sql: %s", same_sql[i]);
+        engine_result_destroy(result);
+    }
+    result = execute_one(engine, "SELECT * FROM Users;");
+    TEST_CHECK(result->status == ENGINE_ERROR);
+    TEST_CHECK(result->error_code == ENGINE_ERROR_NO_TABLE);
+    engine_result_destroy(result);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
+static void field_list_returns_only_named_fields_in_order_test(void)
+{
+    struct engine *engine = users_engine_create();
+    struct engine_result *result =
+        execute_one(engine, "INSERT INTO users VALUES ('kim', 'k@x', 20);");
+
+    engine_result_destroy(result);
+    result = execute_one(engine, "SELECT age, id, name FROM users;");
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_ASSERT(result->field_count == 3);
+    TEST_CHECK(strcmp(result->field_names[0], "age") == 0);
+    TEST_CHECK(strcmp(result->field_names[1], "id") == 0);
+    TEST_CHECK(strcmp(result->field_names[2], "name") == 0);
+    TEST_ASSERT(result->record_count == 1);
+    TEST_CHECK(result->values[0].integer == 20);
+    TEST_CHECK(result->values[1].integer == 1);
+    check_text(&result->values[2], "kim");
+    engine_result_destroy(result);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
+static void where_returns_matching_records_or_none_test(void)
+{
+    struct engine *engine = users_engine_create();
+    const char *inserts[] = {
+        "INSERT INTO users VALUES ('kim', 'k@x', 20);",
+        "INSERT INTO users VALUES ('lee', 'l@x', 31);",
+        "INSERT INTO users VALUES ('park', 'p@x', 20);",
+    };
+    struct engine_result *result;
+
+    for (size_t i = 0; i < sizeof(inserts) / sizeof(inserts[0]); i++) {
+        engine_result_destroy(execute_one(engine, inserts[i]));
+    }
+    result = execute_one(engine, "SELECT name FROM users WHERE age = 20;");
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_ASSERT(result->record_count == 2);
+    check_text(&result->values[0], "kim");
+    check_text(&result->values[1], "park");
+    engine_result_destroy(result);
+
+    result = execute_one(engine, "SELECT * FROM users WHERE name = 'lee';");
+    TEST_ASSERT(result->record_count == 1);
+    TEST_CHECK(result->values[0].integer == 2);
+    engine_result_destroy(result);
+
+    result = execute_one(engine, "SELECT name FROM users WHERE id = 3;");
+    TEST_ASSERT(result->record_count == 1);
+    check_text(&result->values[0], "park");
+    engine_result_destroy(result);
+
+    result = execute_one(engine, "SELECT * FROM users WHERE name = 'choi';");
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_CHECK(result->field_count == 4);
+    TEST_CHECK(result->record_count == 0);
+    engine_result_destroy(result);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
 TEST_LIST = {
     {"[T6] INSERT는 ID 1을 받고 SELECT *가 그 record를 돌려준다",
      insert_returns_id_and_select_returns_record_test},
@@ -167,6 +255,12 @@ TEST_LIST = {
      next_sql_points_after_semicolon_test},
     {"문법, 값 개수, 타입, 테이블이 틀린 문장은 오류를 돌려준다",
      broken_statement_returns_error_test},
+    {"[T7] 키워드는 대소문자를 가리지 않고 테이블 이름은 가린다",
+     keywords_ignore_case_and_table_names_do_not_test},
+    {"[T8] field 목록 SELECT는 요청한 field만 그 순서로 돌려준다",
+     field_list_returns_only_named_fields_in_order_test},
+    {"[T9] WHERE는 값이 같은 record만 돌려주고 없으면 0건이다",
+     where_returns_matching_records_or_none_test},
     {NULL, NULL},
 };
 

@@ -12,12 +12,18 @@ enum statement_kind {
     STATEMENT_SELECT,
 };
 
-/* INSERT의 values는 문장에 적은 순서 그대로입니다. SELECT는 values가 없습니다. */
+/* INSERT의 values는 문장에 적은 순서 그대로입니다. SELECT는 values가 없고,
+   fields가 field 목록입니다. field_count가 0이면 *입니다. where_field가
+   NULL이 아니면 WHERE where_field = where_value입니다. */
 struct statement {
     enum statement_kind kind;
     char *table;
     size_t value_count;
     struct value *values;
+    size_t field_count;
+    char **fields;
+    char *where_field;
+    struct value where_value;
 };
 
 enum sql_status {

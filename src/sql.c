@@ -52,10 +52,14 @@ static void parser_parse_insert(struct parser *parser,
                                 struct statement *statement);
 static void parser_parse_values(struct parser *parser,
                                 struct statement *statement);
+static bool parser_take_value(struct parser *parser, struct value *value);
 static bool statement_add_value(struct statement *statement,
                                 struct value value);
 static void parser_parse_select(struct parser *parser,
                                 struct statement *statement);
+static void parser_parse_fields(struct parser *parser,
+                                struct statement *statement);
+static bool statement_add_field(struct statement *statement, char *field);
 
 enum sql_status sql_parse(const char *sql, struct statement **statement_out,
                           const char **next_sql, char *error, size_t error_size)
@@ -108,6 +112,14 @@ void sql_statement_destroy(struct statement *statement)
         }
     }
     free(statement->values);
+    for (size_t i = 0; i < statement->field_count; i++) {
+        free(statement->fields[i]);
+    }
+    free(statement->fields);
+    free(statement->where_field);
+    if (statement->where_value.type == VALUE_TEXT) {
+        free((char *)statement->where_value.text);
+    }
     free(statement->table);
     free(statement);
 }
@@ -279,32 +291,46 @@ static void parser_parse_values(struct parser *parser,
                                 struct statement *statement)
 {
     for (;;) {
-        struct value value = {0};
+        struct value value;
 
-        if (parser->current.kind == TOKEN_INTEGER) {
-            value.type = VALUE_INT;
-            value.integer = parser->current.integer;
-        } else if (parser->current.kind == TOKEN_STRING) {
-            value.type = VALUE_TEXT;
-            value.text = parser->current.text;
-            value.text_len = (uint32_t)parser->current.length;
-        } else {
-            parser_fail(parser, "expected an integer or a string");
+        if (!parser_take_value(parser, &value)) {
             return;
         }
         if (!statement_add_value(statement, value)) {
+            if (value.type == VALUE_TEXT) {
+                free((char *)value.text);
+            }
             parser_fail(parser, "out of memory");
             return;
         }
-        /* 문장이 문자열의 주인이 되었으므로 토큰에서 떼어 냅니다. */
-        parser->current.text = NULL;
-        parser_advance(parser);
         if (parser->current.kind != TOKEN_SYMBOL ||
             parser->current.symbol != ',') {
             return;
         }
         parser_advance(parser);
     }
+}
+
+/* 지금 토큰이 정수나 문자열이면 *value로 옮기고 다음 토큰으로 넘어갑니다.
+   문자열은 *value가 주인이 됩니다. */
+static bool parser_take_value(struct parser *parser, struct value *value)
+{
+    memset(value, 0, sizeof(*value));
+    if (parser->current.kind == TOKEN_INTEGER) {
+        value->type = VALUE_INT;
+        value->integer = parser->current.integer;
+    } else if (parser->current.kind == TOKEN_STRING) {
+        value->type = VALUE_TEXT;
+        value->text = parser->current.text;
+        value->text_len = (uint32_t)parser->current.length;
+        parser->current.text = NULL;
+    } else {
+        parser_fail(parser, "expected an integer or a string");
+        return false;
+    }
+    parser_advance(parser);
+
+    return true;
 }
 
 static bool statement_add_value(struct statement *statement, struct value value)
@@ -322,12 +348,58 @@ static bool statement_add_value(struct statement *statement, struct value value)
     return true;
 }
 
-/* SELECT * FROM 테이블 */
+/* SELECT (* 또는 field 목록) FROM 테이블 [WHERE field = 값] */
 static void parser_parse_select(struct parser *parser,
                                 struct statement *statement)
 {
     statement->kind = STATEMENT_SELECT;
-    parser_expect_symbol(parser, '*');
+    if (parser->current.kind == TOKEN_SYMBOL && parser->current.symbol == '*') {
+        parser_advance(parser);
+    } else {
+        parser_parse_fields(parser, statement);
+    }
     parser_expect_keyword(parser, "FROM");
     statement->table = parser_expect_name(parser);
+    if (!parser_accept_keyword(parser, "WHERE")) {
+        return;
+    }
+    statement->where_field = parser_expect_name(parser);
+    parser_expect_symbol(parser, '=');
+    parser_take_value(parser, &statement->where_value);
+}
+
+static void parser_parse_fields(struct parser *parser,
+                                struct statement *statement)
+{
+    for (;;) {
+        char *field = parser_expect_name(parser);
+
+        if (field == NULL) {
+            return;
+        }
+        if (!statement_add_field(statement, field)) {
+            free(field);
+            parser_fail(parser, "out of memory");
+            return;
+        }
+        if (parser->current.kind != TOKEN_SYMBOL ||
+            parser->current.symbol != ',') {
+            return;
+        }
+        parser_advance(parser);
+    }
+}
+
+static bool statement_add_field(struct statement *statement, char *field)
+{
+    char **fields = realloc(statement->fields, (statement->field_count + 1) *
+                                                   sizeof(*statement->fields));
+
+    if (fields == NULL) {
+        return false;
+    }
+    statement->fields = fields;
+    statement->fields[statement->field_count++] = field;
+
+    return true;
 }

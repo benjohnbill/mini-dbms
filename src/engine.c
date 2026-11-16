@@ -3,6 +3,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,17 +21,28 @@ struct engine {
 static int engine_load_tables(struct engine *engine, const char *data_dir,
                               char *error, size_t error_size);
 static int engine_add_table(struct engine *engine, struct table *table);
-static void result_fail(struct engine_result *result, const char *format, ...);
+static void result_fail(struct engine_result *result,
+                        enum engine_error_code code, const char *format, ...);
 static struct table *engine_find_table(const struct engine *engine,
                                        const char *name);
 static void execute_insert(struct table *table,
                            const struct statement *statement,
                            struct engine_result *result);
-static void execute_select(struct table *table, struct engine_result *result);
+static void execute_select(struct table *table,
+                           const struct statement *statement,
+                           struct engine_result *result);
+static bool table_find_field(const struct table *table, const char *name,
+                             size_t *source);
+static int where_check(struct engine_result *result, const struct table *table,
+                       const struct statement *statement, size_t *where_source);
+static struct value record_field(const struct record *record, size_t source);
+static bool value_equal(const struct value *left, const struct value *right);
 static int result_set_fields(struct engine_result *result,
-                             const struct table *table);
-static int result_add_record(struct engine_result *result,
                              const struct table *table,
+                             const struct statement *statement,
+                             size_t *sources);
+static int result_add_record(struct engine_result *result,
+                             const size_t *sources,
                              const struct record *record);
 
 struct engine *engine_create(const char *data_dir,
@@ -79,11 +91,12 @@ struct engine_result *engine_execute(struct engine *engine, const char *sql,
     }
     table = engine_find_table(engine, statement->table);
     if (table == NULL) {
-        result_fail(result, "no such table: %s", statement->table);
+        result_fail(result, ENGINE_ERROR_NO_TABLE, "no such table: %s",
+                    statement->table);
     } else if (statement->kind == STATEMENT_INSERT) {
         execute_insert(table, statement, result);
     } else {
-        execute_select(table, result);
+        execute_select(table, statement, result);
     }
     sql_statement_destroy(statement);
 
@@ -171,11 +184,13 @@ static int engine_add_table(struct engine *engine, struct table *table)
     return 0;
 }
 
-static void result_fail(struct engine_result *result, const char *format, ...)
+static void result_fail(struct engine_result *result,
+                        enum engine_error_code code, const char *format, ...)
 {
     va_list args;
 
     result->status = ENGINE_ERROR;
+    result->error_code = code;
     va_start(args, format);
     vsnprintf(result->error_message, sizeof(result->error_message), format,
               args);
@@ -200,13 +215,14 @@ static void execute_insert(struct table *table,
 {
     result->kind = ENGINE_STATEMENT_INSERT;
     if (statement->value_count != table->field_count) {
-        result_fail(result, "%s has %zu fields but got %zu values", table->name,
+        result_fail(result, ENGINE_ERROR_VALUE_COUNT,
+                    "%s has %zu fields but got %zu values", table->name,
                     table->field_count, statement->value_count);
         return;
     }
     for (size_t i = 0; i < table->field_count; i++) {
         if (statement->values[i].type != table->fields[i].type) {
-            result_fail(result, "type mismatch for field %s",
+            result_fail(result, ENGINE_ERROR_TYPE, "type mismatch for field %s",
                         table->fields[i].name);
             return;
         }
@@ -220,53 +236,150 @@ static void execute_insert(struct table *table,
     result->status = ENGINE_OK;
 }
 
-static void execute_select(struct table *table, struct engine_result *result)
+static void execute_select(struct table *table,
+                           const struct statement *statement,
+                           struct engine_result *result)
 {
-    struct record_iterator *iterator;
+    size_t source_count = statement->field_count == 0 ? table->field_count + 1
+                                                      : statement->field_count;
+    size_t *sources = calloc(source_count, sizeof(*sources));
+    struct record_iterator *iterator = NULL;
     struct record record;
+    size_t where_source = 0;
     int status;
 
     result->kind = ENGINE_STATEMENT_SELECT;
-    if (result_set_fields(result, table) != 0) {
-        result_fail(result, "out of memory");
+    if (sources == NULL) {
+        result_fail(result, ENGINE_ERROR_NO_MEMORY, "out of memory");
         return;
     }
-    iterator = table_scan_create(table);
+    if (result_set_fields(result, table, statement, sources) == 0 &&
+        where_check(result, table, statement, &where_source) == 0) {
+        iterator = table_scan_create(table);
+        if (iterator == NULL) {
+            result_fail(result, ENGINE_ERROR_NO_MEMORY, "out of memory");
+        }
+    }
     if (iterator == NULL) {
-        result_fail(result, "out of memory");
+        free(sources);
         return;
     }
     while ((status = iterator->next(iterator, &record)) == 1) {
-        if (result_add_record(result, table, &record) != 0) {
+        struct value field;
+
+        if (statement->where_field != NULL) {
+            field = record_field(&record, where_source);
+            if (!value_equal(&field, &statement->where_value)) {
+                continue;
+            }
+        }
+        if (result_add_record(result, sources, &record) != 0) {
             status = -1;
             break;
         }
     }
     iterator->destroy(iterator);
+    free(sources);
     if (status != 0) {
-        result_fail(result, "%s.tbl: cannot read records", table->name);
+        result_fail(result, ENGINE_ERROR_STORAGE, "%s.tbl: cannot read records",
+                    table->name);
         return;
     }
     result->status = ENGINE_OK;
 }
 
-/* 첫 field는 id이고, 그 뒤는 스키마 순서입니다. */
-static int result_set_fields(struct engine_result *result,
-                             const struct table *table)
+/* field 이름을 record 안의 위치로 바꿉니다. 0은 id이고 i + 1은 스키마의 i번째
+   field입니다. 없으면 false입니다. */
+static bool table_find_field(const struct table *table, const char *name,
+                             size_t *source)
 {
-    size_t field_count = table->field_count + 1;
+    if (strcmp(name, "id") == 0) {
+        *source = 0;
+        return true;
+    }
+    for (size_t i = 0; i < table->field_count; i++) {
+        if (strcmp(table->fields[i].name, name) == 0) {
+            *source = i + 1;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* WHERE의 field가 있고 값의 타입이 그 field와 같은지 확인합니다. 통과하면
+   field의 위치를 *where_source에 씁니다. */
+static int where_check(struct engine_result *result, const struct table *table,
+                       const struct statement *statement, size_t *where_source)
+{
+    enum value_type type;
+
+    if (statement->where_field == NULL) {
+        return 0;
+    }
+    if (!table_find_field(table, statement->where_field, where_source)) {
+        result_fail(result, ENGINE_ERROR_NO_FIELD, "no such field: %s",
+                    statement->where_field);
+        return -1;
+    }
+    type =
+        *where_source == 0 ? VALUE_INT : table->fields[*where_source - 1].type;
+    if (statement->where_value.type != type) {
+        result_fail(result, ENGINE_ERROR_TYPE, "type mismatch for field %s",
+                    statement->where_field);
+        return -1;
+    }
+    return 0;
+}
+
+static bool value_equal(const struct value *left, const struct value *right)
+{
+    if (left->type == VALUE_INT) {
+        return left->integer == right->integer;
+    }
+    return left->text_len == right->text_len &&
+           memcmp(left->text, right->text, left->text_len) == 0;
+}
+
+static struct value record_field(const struct record *record, size_t source)
+{
+    struct value value = {.type = VALUE_INT, .integer = record->id};
+
+    return source == 0 ? value : record->values[source - 1];
+}
+
+/* 결과의 field 이름과 각 field가 record의 어디에서 오는지 정합니다. *는 id와
+   스키마 순서의 모든 field입니다. sources는 결과 field 수만큼 있어야 합니다.
+   실패하면 result에 오류를 씁니다. */
+static int result_set_fields(struct engine_result *result,
+                             const struct table *table,
+                             const struct statement *statement, size_t *sources)
+{
+    size_t field_count = statement->field_count == 0 ? table->field_count + 1
+                                                     : statement->field_count;
 
     result->field_names = calloc(field_count, sizeof(*result->field_names));
     if (result->field_names == NULL) {
+        result_fail(result, ENGINE_ERROR_NO_MEMORY, "out of memory");
         return -1;
     }
     result->field_count = field_count;
-    result->field_names[0] = strdup("id");
-    for (size_t i = 0; i < table->field_count; i++) {
-        result->field_names[i + 1] = strdup(table->fields[i].name);
-    }
     for (size_t i = 0; i < field_count; i++) {
+        const char *name;
+
+        if (statement->field_count == 0) {
+            sources[i] = i;
+            name = i == 0 ? "id" : table->fields[i - 1].name;
+        } else if (!table_find_field(table, statement->fields[i],
+                                     &sources[i])) {
+            result_fail(result, ENGINE_ERROR_NO_FIELD, "no such field: %s",
+                        statement->fields[i]);
+            return -1;
+        } else {
+            name = statement->fields[i];
+        }
+        result->field_names[i] = strdup(name);
         if (result->field_names[i] == NULL) {
+            result_fail(result, ENGINE_ERROR_NO_MEMORY, "out of memory");
             return -1;
         }
     }
@@ -276,8 +389,7 @@ static int result_set_fields(struct engine_result *result,
 /* record를 결과로 복사합니다. iterator의 text는 다음 next에서 바뀌기
    때문입니다. */
 static int result_add_record(struct engine_result *result,
-                             const struct table *table,
-                             const struct record *record)
+                             const size_t *sources, const struct record *record)
 {
     size_t field_count = result->field_count;
     struct value *values =
@@ -291,25 +403,22 @@ static int result_add_record(struct engine_result *result,
     result->values = values;
     record_values = &values[result->record_count * field_count];
     memset(record_values, 0, field_count * sizeof(*record_values));
-    record_values[0].type = VALUE_INT;
-    record_values[0].integer = record->id;
     result->record_count++;
-    for (size_t i = 0; i < table->field_count; i++) {
-        struct value *copy = &record_values[i + 1];
-        const struct value *source = &record->values[i];
+    for (size_t i = 0; i < field_count; i++) {
+        struct value source = record_field(record, sources[i]);
         char *text;
 
-        *copy = *source;
-        if (source->type != VALUE_TEXT) {
+        record_values[i] = source;
+        if (source.type != VALUE_TEXT) {
             continue;
         }
-        text = malloc((size_t)source->text_len + 1);
-        copy->text = text;
+        text = malloc((size_t)source.text_len + 1);
+        record_values[i].text = text;
         if (text == NULL) {
             return -1;
         }
-        memcpy(text, source->text, source->text_len);
-        text[source->text_len] = '\0';
+        memcpy(text, source.text, source.text_len);
+        text[source.text_len] = '\0';
     }
     return 0;
 }

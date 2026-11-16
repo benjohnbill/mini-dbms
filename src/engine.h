@@ -30,11 +30,26 @@ enum engine_statement_kind {
     ENGINE_STATEMENT_SELECT,
 };
 
+/* 오류의 종류입니다. API 서버는 이 값으로 응답을 고릅니다. */
+enum engine_error_code {
+    ENGINE_ERROR_NONE,
+    ENGINE_ERROR_SYNTAX,
+    ENGINE_ERROR_NO_TABLE,
+    ENGINE_ERROR_NO_FIELD,
+    ENGINE_ERROR_VALUE_COUNT,
+    ENGINE_ERROR_TYPE,
+    ENGINE_ERROR_INT_RANGE,
+    ENGINE_ERROR_TEXT_TOO_LONG,
+    ENGINE_ERROR_STORAGE, /* 테이블 파일 읽기와 쓰기 */
+    ENGINE_ERROR_NO_MEMORY,
+};
+
 /* 실행 결과 하나입니다. 받은 쪽이 engine_result_destroy()로 해제합니다.
    record i의 field j는 values[i * field_count + j]에 있습니다. */
 struct engine_result {
     enum engine_status status;
     enum engine_statement_kind kind;
+    enum engine_error_code error_code;
     char error_message[ENGINE_ERROR_MAX];
     int64_t inserted_id;
     size_t field_count;
