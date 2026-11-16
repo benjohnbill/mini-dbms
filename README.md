@@ -104,9 +104,9 @@ mini-dbms [--data 폴더] dump <테이블>
 
 | 명령 | 하는 일 |
 |---|---|
-| `make` | CLI와 단위 테스트를 빌드합니다 |
+| `make` | CLI, API 서버(`build/mini-dbms-server`), 단위 테스트를 빌드합니다 |
 | `make test` | 단위 테스트를 실행합니다 |
-| `make functional` | CLI를 바깥에서 실행하는 기능 테스트를 실행합니다 |
+| `make functional` | CLI와 API 서버를 바깥에서 실행하는 기능 테스트를 실행합니다. 서버 기능 테스트는 서버를 띄워 실제 HTTP 요청을 보냅니다 |
 | `make lint` | 코드 모양, 이름, 중괄호 규칙을 검사합니다 |
 | `make format` | 코드 모양 위반을 자동으로 고칩니다 |
 | `make clean` | `build/` 폴더를 지웁니다 |
