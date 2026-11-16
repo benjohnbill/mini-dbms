@@ -38,7 +38,7 @@ struct token {
 /* previous는 오류 메시지의 "X 다음에"에 쓰는 바로 앞 토큰입니다. text는
    비어 있습니다. */
 struct parser {
-    const char *cursor;
+    const char *next_char;
     size_t line;
     const char *line_start;
     struct token current;
@@ -54,7 +54,7 @@ static void parser_advance(struct parser *parser);
 static void parser_skip_space(struct parser *parser);
 static void token_read_integer(struct parser *parser);
 static void token_read_string(struct parser *parser);
-static size_t string_span_get(const char *cursor);
+static size_t string_span_get(const char *next_char);
 static bool parser_at_symbol(const struct parser *parser, char symbol);
 static bool parser_accept_keyword(struct parser *parser, const char *keyword);
 static void parser_expect_keyword(struct parser *parser, const char *keyword,
@@ -79,12 +79,12 @@ enum sql_status sql_parse(const char *sql, struct statement **statement_out,
                           const char **next_sql, struct sql_error *error)
 {
     struct parser parser = {
-        .cursor = sql, .line = 1, .line_start = sql, .error = error};
+        .next_char = sql, .line = 1, .line_start = sql, .error = error};
     struct statement *statement;
 
     parser_advance(&parser);
     if (parser.current.kind == TOKEN_END && !parser.failed) {
-        *next_sql = parser.cursor;
+        *next_sql = parser.next_char;
         return SQL_EMPTY;
     }
     statement = calloc(1, sizeof(*statement));
@@ -179,51 +179,51 @@ static void parser_fail_expected(struct parser *parser, const char *expected)
 
 static void parser_advance(struct parser *parser)
 {
-    const char *cursor;
+    const char *next_char;
 
     free(parser->current.text);
     parser->current.text = NULL;
     parser->previous = parser->current;
     memset(&parser->current, 0, sizeof(parser->current));
     parser_skip_space(parser);
-    cursor = parser->cursor;
-    parser->current.start = cursor;
+    next_char = parser->next_char;
+    parser->current.start = next_char;
     parser->current.line = parser->line;
-    parser->current.byte_in_line = (size_t)(cursor - parser->line_start) + 1;
-    if (parser->failed || *cursor == '\0') {
+    parser->current.byte_in_line = (size_t)(next_char - parser->line_start) + 1;
+    if (parser->failed || *next_char == '\0') {
         parser->current.kind = TOKEN_END;
-    } else if (isalpha((unsigned char)*cursor) || *cursor == '_') {
-        while (isalnum((unsigned char)*cursor) || *cursor == '_') {
-            cursor++;
+    } else if (isalpha((unsigned char)*next_char) || *next_char == '_') {
+        while (isalnum((unsigned char)*next_char) || *next_char == '_') {
+            next_char++;
         }
         parser->current.kind = TOKEN_WORD;
-        parser->current.length = (size_t)(cursor - parser->current.start);
-        parser->cursor = cursor;
-    } else if (isdigit((unsigned char)*cursor) ||
-               (*cursor == '-' && isdigit((unsigned char)cursor[1]))) {
+        parser->current.length = (size_t)(next_char - parser->current.start);
+        parser->next_char = next_char;
+    } else if (isdigit((unsigned char)*next_char) ||
+               (*next_char == '-' && isdigit((unsigned char)next_char[1]))) {
         token_read_integer(parser);
-    } else if (*cursor == '\'') {
+    } else if (*next_char == '\'') {
         token_read_string(parser);
-    } else if (cursor[0] == '-' && cursor[1] == '-') {
+    } else if (next_char[0] == '-' && next_char[1] == '-') {
         parser_fail(parser, SQL_ERROR_SYNTAX, "주석(--)은 지원하지 않습니다");
         parser->current.kind = TOKEN_END;
     } else {
         parser->current.kind = TOKEN_SYMBOL;
-        parser->current.symbol = *cursor;
+        parser->current.symbol = *next_char;
         parser->current.length = 1;
-        parser->cursor = cursor + 1;
+        parser->next_char = next_char + 1;
     }
 }
 
 /* 공백을 건너뛰며 줄 번호를 셉니다. */
 static void parser_skip_space(struct parser *parser)
 {
-    while (isspace((unsigned char)*parser->cursor)) {
-        if (*parser->cursor == '\n') {
+    while (isspace((unsigned char)*parser->next_char)) {
+        if (*parser->next_char == '\n') {
             parser->line++;
-            parser->line_start = parser->cursor + 1;
+            parser->line_start = parser->next_char + 1;
         }
-        parser->cursor++;
+        parser->next_char++;
     }
 }
 
@@ -233,7 +233,7 @@ static void token_read_integer(struct parser *parser)
     long long integer;
 
     errno = 0;
-    integer = strtoll(parser->cursor, &end, 10);
+    integer = strtoll(parser->next_char, &end, 10);
     if (errno == ERANGE) {
         parser_fail(parser, SQL_ERROR_INT_RANGE,
                     "INT 범위(64비트 부호 있는 정수)를 넘는 숫자입니다");
@@ -242,17 +242,17 @@ static void token_read_integer(struct parser *parser)
     }
     parser->current.kind = TOKEN_INTEGER;
     parser->current.integer = integer;
-    parser->current.length = (size_t)(end - parser->cursor);
-    parser->cursor = end;
+    parser->current.length = (size_t)(end - parser->next_char);
+    parser->next_char = end;
 }
 
 /* '...' 안의 ''는 작은따옴표 하나입니다. 문자열 안의 줄바꿈도 줄 번호에
    셉니다. */
 static void token_read_string(struct parser *parser)
 {
-    const char *cursor = parser->cursor + 1;
+    const char *next_char = parser->next_char + 1;
     size_t text_len = 0;
-    char *text = malloc(string_span_get(cursor) + 1);
+    char *text = malloc(string_span_get(next_char) + 1);
 
     if (text == NULL) {
         parser_fail(parser, SQL_ERROR_NO_MEMORY, "메모리가 부족합니다");
@@ -260,17 +260,17 @@ static void token_read_string(struct parser *parser)
         return;
     }
     for (;;) {
-        if (*cursor == '\0') {
+        if (*next_char == '\0') {
             free(text);
             parser_fail(parser, SQL_ERROR_SYNTAX, "닫히지 않은 문자열입니다");
             parser->current.kind = TOKEN_END;
             return;
         }
-        if (*cursor == '\'' && cursor[1] != '\'') {
+        if (*next_char == '\'' && next_char[1] != '\'') {
             break;
         }
-        if (*cursor == '\'') {
-            cursor++;
+        if (*next_char == '\'') {
+            next_char++;
         }
         if (text_len == TEXT_MAX_BYTES) {
             free(text);
@@ -279,35 +279,35 @@ static void token_read_string(struct parser *parser)
             parser->current.kind = TOKEN_END;
             return;
         }
-        if (*cursor == '\n') {
+        if (*next_char == '\n') {
             parser->line++;
-            parser->line_start = cursor + 1;
+            parser->line_start = next_char + 1;
         }
-        text[text_len++] = *cursor++;
+        text[text_len++] = *next_char++;
     }
     text[text_len] = '\0';
     parser->current.kind = TOKEN_STRING;
     parser->current.text = text;
     parser->current.length = text_len;
-    parser->cursor = cursor + 1;
+    parser->next_char = next_char + 1;
 }
 
 /* 여는 따옴표 다음부터 닫는 따옴표 앞까지의 바이트 수이고, 읽은 TEXT 값은
    이보다 길지 않습니다. 남은 SQL 전체가 아니라 이 길이만큼 할당하므로,
    문자열마다 파일 끝까지 세던 일이 없어 100만 줄 SQL 파일도 줄 수에
    비례해 읽습니다. 상한을 넘으면 거기서 멈춥니다. */
-static size_t string_span_get(const char *cursor)
+static size_t string_span_get(const char *next_char)
 {
-    const char *end = cursor;
+    const char *end = next_char;
 
-    while (*end != '\0' && (size_t)(end - cursor) <= TEXT_MAX_BYTES) {
+    while (*end != '\0' && (size_t)(end - next_char) <= TEXT_MAX_BYTES) {
         if (*end == '\'' && end[1] != '\'') {
             break;
         }
         end += *end == '\'' ? 2 : 1;
     }
 
-    return (size_t)(end - cursor);
+    return (size_t)(end - next_char);
 }
 
 static bool parser_at_symbol(const struct parser *parser, char symbol)

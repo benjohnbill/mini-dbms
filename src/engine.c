@@ -82,7 +82,6 @@ static void execute_select(struct table *table,
 static struct record_iterator *
 select_iterator_create(struct table *table, const struct statement *statement,
                        const uint64_t *cursor, struct engine_result *result);
-static bool cursor_is_valid(struct table *table, uint64_t cursor);
 static void select_part_end(struct engine_result *result,
                             const struct engine_options *options,
                             const struct record *record);
@@ -93,8 +92,6 @@ static size_t record_bytes_get(const struct engine_result *result,
                                size_t record_index);
 static void result_records_clear(struct engine_result *result);
 static void result_last_record_drop(struct engine_result *result);
-static bool table_find_field(const struct table *table, const char *name,
-                             size_t *source);
 static int where_check(struct engine_result *result, const struct table *table,
                        const struct statement *statement, size_t *where_source);
 static struct value record_field(const struct record *record, size_t source);
@@ -611,7 +608,7 @@ select_iterator_create(struct table *table, const struct statement *statement,
 {
     struct record_iterator *iterator;
 
-    if (cursor != NULL && !cursor_is_valid(table, *cursor)) {
+    if (cursor != NULL && !table_cursor_is_valid(table, *cursor)) {
         result_fail(result, ENGINE_REASON_INVALID_CURSOR,
                     "커서 %llu는 record가 시작하는 위치가 아닙니다",
                     (unsigned long long)*cursor);
@@ -625,17 +622,6 @@ select_iterator_create(struct table *table, const struct statement *statement,
     }
 
     return iterator;
-}
-
-/* 파일 끝은 읽을 record가 없는 올바른 커서입니다. 테이블 파일은 덧붙이기만
-   하므로, 앞서 돌려준 커서는 뒤의 INSERT가 있어도 계속 record 시작입니다. */
-static bool cursor_is_valid(struct table *table, uint64_t cursor)
-{
-    if (cursor > table->committed_size) {
-        return false;
-    }
-    return cursor == table->committed_size ||
-           table_record_starts_at(table, cursor);
 }
 
 /* 결과 상한에 닿아 멈춘 SELECT를 끝냅니다. 상한을 넘게 한 마지막 record는
@@ -657,25 +643,6 @@ static void select_part_end(struct engine_result *result,
     result->has_next_cursor = true;
     result->next_cursor = record->offset;
     result->status = ENGINE_OK;
-}
-
-/* field 이름을 record 안의 위치로 바꿉니다. 0은 id이고 i + 1은 스키마의 i번째
-   field입니다. 없으면 false입니다. */
-static bool table_find_field(const struct table *table, const char *name,
-                             size_t *source)
-{
-    if (strcmp(name, "id") == 0) {
-        *source = 0;
-        return true;
-    }
-    for (size_t i = 0; i < table->field_count; i++) {
-        if (strcmp(table->fields[i].name, name) == 0) {
-            *source = i + 1;
-            return true;
-        }
-    }
-
-    return false;
 }
 
 /* WHERE의 field가 있고 값의 타입이 그 field와 같은지 확인합니다. 통과하면

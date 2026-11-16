@@ -34,14 +34,14 @@
 #define ARGUMENT_COUNT 3
 #define DECIMAL 10
 
-/* 질의 세트의 한 줄입니다. 레코드 위치를 하나 더하려면 positions_fill에 한
+/* 문장 세트의 한 줄입니다. 찾을 레코드를 하나 더하려면 targets_fill에 한
    줄을 더합니다. number가 record 수보다 크면 없는 값입니다. */
-struct bench_position {
+struct bench_target {
     const char *label;
     int64_t number;
 };
 
-/* 한 질의를 runs번 잰 결과입니다. 시간은 ms입니다. */
+/* 한 문장을 runs번 잰 결과입니다. 시간은 ms입니다. */
 struct bench_timing {
     double median;
     double p99;
@@ -55,21 +55,21 @@ enum bench_way {
     BENCH_WAY_FORCED_SCAN, /* WHERE id = k를 강제로 SCAN합니다 */
 };
 
-#define POSITION_COUNT 4
+#define TARGET_COUNT 4
 #define WAY_COUNT 3
 
 static int records_bench_run(const char *data_dir, int64_t record_count);
 static int nodes_bench_run(int64_t key_count);
 static bool count_parse(const char *text, int64_t *count);
 static double clock_now(void);
-static void positions_fill(struct bench_position *positions,
-                           int64_t record_count);
+static void targets_fill(struct bench_target *targets, int64_t record_count);
 static void sql_format(char *sql, enum bench_way way, int64_t number);
-static struct engine_result *query_run(struct engine *engine,
-                                       enum bench_way way, const char *sql);
-static int query_measure(struct engine *engine, enum bench_way way,
-                         const char *sql, int runs, struct bench_timing *timing,
-                         struct engine_result **last_result);
+static struct engine_result *statement_run(struct engine *engine,
+                                           enum bench_way way, const char *sql);
+static int statement_measure(struct engine *engine, enum bench_way way,
+                             const char *sql, int runs,
+                             struct bench_timing *timing,
+                             struct engine_result **last_result);
 static void timing_compute(double *samples, int runs,
                            struct bench_timing *timing);
 static int compare_doubles(const void *left, const void *right);
@@ -98,13 +98,13 @@ int main(int argc, char **argv)
 }
 
 /* 엔진 준비 시간(테이블 파일을 읽어 다음 ID와 B+ 트리를 만드는 시간)은
-   따로 적고, 질의 시간은 준비가 끝난 뒤부터 잽니다. */
+   따로 적고, 문장 실행 시간은 준비가 끝난 뒤부터 잽니다. */
 static int records_bench_run(const char *data_dir, int64_t record_count)
 {
     static const char *const way_names[WAY_COUNT] = {"id", "email",
                                                      "forced-scan"};
     static const int way_runs[WAY_COUNT] = {INDEX_RUNS, SCAN_RUNS, SCAN_RUNS};
-    struct bench_position positions[POSITION_COUNT];
+    struct bench_target targets[TARGET_COUNT];
     char error[ENGINE_ERROR_MAX] = "";
     char sql[SQL_MAX];
     double started = clock_now();
@@ -118,25 +118,25 @@ static int records_bench_run(const char *data_dir, int64_t record_count)
     printf("engine ready: %.1f ms (records %lld, node keys %d)\n",
            (clock_now() - started) * 1000.0, (long long)record_count,
            BPTREE_NODE_KEYS);
-    positions_fill(positions, record_count);
+    targets_fill(targets, record_count);
     /* 두 경로를 한 번씩 데웁니다. */
     for (int way = BENCH_WAY_ID; way <= BENCH_WAY_EMAIL; way++) {
-        sql_format(sql, (enum bench_way)way, positions[0].number);
-        engine_result_destroy(query_run(engine, (enum bench_way)way, sql));
+        sql_format(sql, (enum bench_way)way, targets[0].number);
+        engine_result_destroy(statement_run(engine, (enum bench_way)way, sql));
     }
     printf("%-8s %-11s %-5s %5s %8s %10s %10s %10s %10s %s\n", "position",
            "way", "path", "runs", "records", "examined", "median_ms", "p99_ms",
            "min_ms", "max_ms");
-    for (int i = 0; i < POSITION_COUNT && status == 0; i++) {
+    for (int i = 0; i < TARGET_COUNT && status == 0; i++) {
         struct engine_result *results[WAY_COUNT] = {NULL, NULL, NULL};
 
         for (int way = 0; way < WAY_COUNT && status == 0; way++) {
             struct bench_timing timing;
             struct engine_result *result;
 
-            sql_format(sql, (enum bench_way)way, positions[i].number);
-            status = query_measure(engine, (enum bench_way)way, sql,
-                                   way_runs[way], &timing, &results[way]);
+            sql_format(sql, (enum bench_way)way, targets[i].number);
+            status = statement_measure(engine, (enum bench_way)way, sql,
+                                       way_runs[way], &timing, &results[way]);
             if (status != 0) {
                 fprintf(stderr, "%s: query failed\n", sql);
                 break;
@@ -144,7 +144,7 @@ static int records_bench_run(const char *data_dir, int64_t record_count)
             result = results[way];
             printf("%-8s %-11s %-5s %5d %8zu %10llu %10.4f %10.4f %10.4f "
                    "%10.4f\n",
-                   positions[i].label, way_names[way],
+                   targets[i].label, way_names[way],
                    result->access_path == ENGINE_ACCESS_PATH_INDEX ? "INDEX"
                                                                    : "SCAN",
                    way_runs[way], result->record_count,
@@ -154,7 +154,7 @@ static int records_bench_run(const char *data_dir, int64_t record_count)
         if (status == 0 && (!results_are_same(results[0], results[1]) ||
                             !results_are_same(results[0], results[2]))) {
             fprintf(stderr, "%s: INDEX and SCAN results differ\n",
-                    positions[i].label);
+                    targets[i].label);
             status = -1;
         }
         for (int way = 0; way < WAY_COUNT; way++) {
@@ -243,13 +243,12 @@ static double clock_now(void)
 
 /* 앞, 중간, 뒤는 테이블 파일 안의 위치이고, SCAN 시간은 위치와 상관없이
    파일 전체를 읽습니다. 없는 값은 INDEX가 record를 읽지 않는 경우입니다. */
-static void positions_fill(struct bench_position *positions,
-                           int64_t record_count)
+static void targets_fill(struct bench_target *targets, int64_t record_count)
 {
-    positions[0] = (struct bench_position){"front", 1};
-    positions[1] = (struct bench_position){"middle", (record_count + 1) / 2};
-    positions[2] = (struct bench_position){"back", record_count};
-    positions[3] = (struct bench_position){"missing", record_count + 1};
+    targets[0] = (struct bench_target){"front", 1};
+    targets[1] = (struct bench_target){"middle", (record_count + 1) / 2};
+    targets[2] = (struct bench_target){"back", record_count};
+    targets[3] = (struct bench_target){"missing", record_count + 1};
 }
 
 /* email 값은 scripts/generate-users.py의 번호 규칙과 같습니다. */
@@ -266,8 +265,8 @@ static void sql_format(char *sql, enum bench_way way, int64_t number)
              (long long)number);
 }
 
-static struct engine_result *query_run(struct engine *engine,
-                                       enum bench_way way, const char *sql)
+static struct engine_result *statement_run(struct engine *engine,
+                                           enum bench_way way, const char *sql)
 {
     struct engine_result *result;
 
@@ -281,9 +280,10 @@ static struct engine_result *query_run(struct engine *engine,
 /* 문장 하나를 넘겨 결과 구조체를 받기까지를 runs번 잽니다. 결과 해제는
    시간에 넣지 않습니다. 마지막 결과는 비교에 쓰도록 *last_result에
    남깁니다. */
-static int query_measure(struct engine *engine, enum bench_way way,
-                         const char *sql, int runs, struct bench_timing *timing,
-                         struct engine_result **last_result)
+static int statement_measure(struct engine *engine, enum bench_way way,
+                             const char *sql, int runs,
+                             struct bench_timing *timing,
+                             struct engine_result **last_result)
 {
     double *samples = calloc((size_t)runs, sizeof(*samples));
 
@@ -292,7 +292,7 @@ static int query_measure(struct engine *engine, enum bench_way way,
     }
     for (int i = 0; i < runs; i++) {
         double started = clock_now();
-        struct engine_result *result = query_run(engine, way, sql);
+        struct engine_result *result = statement_run(engine, way, sql);
 
         samples[i] = (clock_now() - started) * 1000.0;
         if (result == NULL || result->status != ENGINE_OK) {

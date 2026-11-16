@@ -81,9 +81,15 @@ enum table_insert_status table_insert(struct table *table,
    시작하는 위치여야 합니다. 처음부터 읽으려면 0을 넘깁니다. */
 struct record_iterator *table_scan_create(struct table *table, uint64_t start);
 
-/* offset에서 record 하나가 시작하면 참입니다. 그 위치의 record를 읽고, 그
-   id를 B+ 트리에서 찾아 같은 offset이 나오는지 봅니다. */
-bool table_record_starts_at(struct table *table, uint64_t offset);
+/* cursor가 record가 시작하는 위치이거나 committed_size이면 참입니다. 그
+   위치의 record를 읽고, 그 id를 B+ 트리에서 찾아 같은 offset이 나오는지
+   봅니다. 파일 끝은 읽을 record가 없는 올바른 커서입니다. */
+bool table_cursor_is_valid(struct table *table, uint64_t cursor);
+
+/* field 이름을 record 안의 위치로 바꿉니다. 0은 id이고 i + 1은 스키마의 i번째
+   field입니다. 없으면 false입니다. */
+bool table_find_field(const struct table *table, const char *name,
+                      size_t *source);
 
 /* B+ 트리에서 target_id의 offset을 찾아 그 record 하나만 읽는 INDEX
    iterator입니다. target_id가 없으면 record를 읽지 않고 바로 끝납니다. */

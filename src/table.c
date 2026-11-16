@@ -226,22 +226,45 @@ struct record_iterator *table_scan_create(struct table *table, uint64_t start)
     return &scan->iterator;
 }
 
-bool table_record_starts_at(struct table *table, uint64_t offset)
+/* 테이블 파일은 덧붙이기만 하므로, 앞서 돌려준 커서는 뒤의 INSERT가 있어도
+   계속 record 시작입니다. */
+bool table_cursor_is_valid(struct table *table, uint64_t cursor)
 {
-    struct record_iterator *iterator = table_scan_create(table, offset);
+    struct record_iterator *iterator;
     struct record record;
     uint64_t tree_offset;
     bool starts;
 
+    if (cursor >= table->committed_size) {
+        return cursor == table->committed_size;
+    }
+    iterator = table_scan_create(table, cursor);
     if (iterator == NULL) {
         return false;
     }
     starts = iterator->next(iterator, &record) == 1 &&
              bptree_find(table->tree, record.id, &tree_offset) &&
-             tree_offset == offset;
+             tree_offset == cursor;
     iterator->destroy(iterator);
 
     return starts;
+}
+
+bool table_find_field(const struct table *table, const char *name,
+                      size_t *source)
+{
+    if (strcmp(name, "id") == 0) {
+        *source = 0;
+        return true;
+    }
+    for (size_t i = 0; i < table->field_count; i++) {
+        if (strcmp(table->fields[i].name, name) == 0) {
+            *source = i + 1;
+            return true;
+        }
+    }
+
+    return false;
 }
 
 struct record_iterator *table_index_create(struct table *table,
