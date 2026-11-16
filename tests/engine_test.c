@@ -776,6 +776,7 @@ static size_t text_record_put(unsigned char *bytes, uint32_t body_len,
     size += put_le(bytes + size, (uint64_t)new_id, 8);
     size += put_le(bytes + size, text_len, 4);
     memcpy(bytes + size, text, strlen(text));
+
     return size + strlen(text);
 }
 
@@ -1222,6 +1223,7 @@ static void *concurrent_insert_main(void *arg)
         insert->inserted_id = result->inserted_id;
         engine_result_destroy(result);
     }
+
     return NULL;
 }
 
@@ -1300,6 +1302,7 @@ static void *mixed_writer_main(void *arg)
     pthread_mutex_lock(&run->mutex);
     run->writers_left--;
     pthread_mutex_unlock(&run->mutex);
+
     return NULL;
 }
 
@@ -1310,6 +1313,7 @@ static bool mixed_run_is_writing(struct mixed_run *run)
     pthread_mutex_lock(&run->mutex);
     writing = run->writers_left > 0;
     pthread_mutex_unlock(&run->mutex);
+
     return writing;
 }
 
@@ -1422,6 +1426,7 @@ static void *index_reader_main(void *arg)
         }
         reader->selects++;
     }
+
     return NULL;
 }
 
@@ -1446,6 +1451,7 @@ static void *mixed_reader_main(void *arg)
         engine_result_destroy(result);
         reader->selects++;
     }
+
     return NULL;
 }
 
@@ -1546,6 +1552,7 @@ static ssize_t held_first_pwrite(int fd, const void *bytes, size_t size,
         start_gate_open(&held_write_entered);
         start_gate_wait(&held_write_release);
     }
+
     return pwrite(fd, bytes, size, offset);
 }
 
@@ -1559,6 +1566,7 @@ static void *held_users_insert_main(void *arg)
         *status = result == NULL ? ENGINE_ERROR : result->status;
     }
     engine_result_destroy(result);
+
     return status;
 }
 
@@ -2137,6 +2145,7 @@ static ssize_t part_then_fail_pwrite(int fd, const void *bytes, size_t size,
         return pwrite(fd, bytes, size / 2, offset);
     }
     errno = ENOSPC;
+
     return -1;
 }
 
@@ -2182,6 +2191,7 @@ static ssize_t small_interrupted_pwrite(int fd, const void *bytes, size_t size,
         return -1;
     }
     interrupt_next = true;
+
     return pwrite(fd, bytes, size < 3 ? size : 3, offset);
 }
 

@@ -161,6 +161,7 @@ static int probe_get(struct probe *probe, const int *count)
     pthread_mutex_lock(&probe->mutex);
     value = *count;
     pthread_mutex_unlock(&probe->mutex);
+
     return value;
 }
 
@@ -189,6 +190,7 @@ static void *reader_main(void *arg)
     rwlock_read_lock(&probe->lock);
     probe_add(probe, &probe->readers_in);
     rwlock_read_unlock(&probe->lock);
+
     return NULL;
 }
 
@@ -199,6 +201,7 @@ static void *writer_main(void *arg)
     rwlock_write_lock(&probe->lock);
     probe_add(probe, &probe->writers_in);
     rwlock_write_unlock(&probe->lock);
+
     return NULL;
 }
 
@@ -211,6 +214,7 @@ static void *held_reader_main(void *arg)
     probe_add(probe, &probe->readers_in);
     probe_wait_release(probe);
     rwlock_read_unlock(&probe->lock);
+
     return NULL;
 }
 
@@ -222,6 +226,7 @@ static void *held_writer_main(void *arg)
     probe_add(probe, &probe->writers_in);
     probe_wait_release(probe);
     rwlock_write_unlock(&probe->lock);
+
     return NULL;
 }
 

@@ -18,6 +18,7 @@ int rwlock_init(struct rwlock *lock)
         pthread_mutex_destroy(&lock->mutex);
         return -1;
     }
+
     return 0;
 }
 

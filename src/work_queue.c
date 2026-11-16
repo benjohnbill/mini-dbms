@@ -56,6 +56,7 @@ struct work_queue *work_queue_create(size_t thread_count, size_t capacity,
         }
         queue->thread_count++;
     }
+
     return queue;
 }
 
@@ -114,6 +115,7 @@ static void *worker_main(void *arg)
     while ((job = queue_take(queue)) != NULL) {
         queue->handler(job, queue->context);
     }
+
     return NULL;
 }
 

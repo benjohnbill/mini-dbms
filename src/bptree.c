@@ -313,6 +313,7 @@ static size_t inner_child_index(const struct node *inner, int64_t key)
     if (index < inner->key_count && inner->keys[index] == key) {
         index++;
     }
+
     return index;
 }
 
@@ -334,6 +335,7 @@ static const struct node *leftmost_leaf_find(const struct node *node,
         node = node->children[0];
         (*depth)++;
     }
+
     return node;
 }
 
@@ -349,6 +351,7 @@ static bool leaf_depths_are_equal(const struct node *node, size_t depth,
             return false;
         }
     }
+
     return true;
 }
 
@@ -362,5 +365,6 @@ static size_t node_count_get(const struct node *node)
             count += node_count_get(node->children[i]);
         }
     }
+
     return count;
 }

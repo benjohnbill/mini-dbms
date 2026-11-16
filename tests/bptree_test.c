@@ -219,6 +219,7 @@ static bool keys_are_found(const struct bptree *tree, int64_t first,
             return false;
         }
     }
+
     return true;
 }
 

@@ -306,6 +306,7 @@ static size_t string_span_get(const char *cursor)
         }
         end += *end == '\'' ? 2 : 1;
     }
+
     return (size_t)(end - cursor);
 }
 
@@ -324,6 +325,7 @@ static bool parser_accept_keyword(struct parser *parser, const char *keyword)
         return false;
     }
     parser_advance(parser);
+
     return true;
 }
 

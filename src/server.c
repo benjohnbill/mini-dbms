@@ -267,6 +267,7 @@ int main(int argc, char *argv[])
                 DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SHUTDOWN_WAIT_MS);
         return EXIT_USAGE;
     }
+
     return server_run(&args);
 }
 
@@ -307,6 +308,7 @@ static int args_parse(int argc, char *argv[], struct server_args *args)
         }
         i++;
     }
+
     return 0;
 }
 
@@ -322,6 +324,7 @@ static bool number_parse(const char *text, long min, long max, long *number)
         return false;
     }
     *number = parsed;
+
     return true;
 }
 
@@ -467,6 +470,7 @@ static bool replies_are_pending(const struct mg_mgr *manager)
             return true;
         }
     }
+
     return false;
 }
 
@@ -691,6 +695,7 @@ static enum body_length_status body_length_parse(struct mg_str head,
     if (encoding_count > 0) {
         return BODY_LENGTH_CHUNKED;
     }
+
     return length_count == 1 ? BODY_LENGTH_DECLARED : BODY_LENGTH_MISSING;
 }
 
@@ -715,6 +720,7 @@ static bool header_has_token(struct mg_http_message *message, const char *name,
             return true;
         }
     }
+
     return false;
 }
 
@@ -775,6 +781,7 @@ static bool cursor_parse(struct mg_str query, bool *has_cursor,
         number = number * 10 + digit;
     }
     *cursor = number;
+
     return true;
 }
 
@@ -953,6 +960,7 @@ static struct mg_connection *connection_find(struct mg_mgr *manager,
             return connection;
         }
     }
+
     return NULL;
 }
 
@@ -1112,6 +1120,7 @@ static bool json_result_write(FILE *out, const struct engine_result *result)
         }
         fputc('}', out);
     }
+
     return true;
 }
 
@@ -1141,6 +1150,7 @@ static size_t json_record_size(const struct engine_result *result,
             }
         }
     }
+
     return size;
 }
 

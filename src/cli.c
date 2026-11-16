@@ -116,6 +116,7 @@ static int args_parse(int argc, char *argv[], struct cli_args *args)
         args->dump_table = positional[1];
         return 0;
     }
+
     return -1;
 }
 

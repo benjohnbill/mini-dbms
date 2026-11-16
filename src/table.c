@@ -365,6 +365,7 @@ static int schema_type_parse(const char *type_name, enum value_type *type)
     } else {
         return -1;
     }
+
     return 0;
 }
 
@@ -375,6 +376,7 @@ static bool schema_has_field(const struct table *table, const char *name)
             return true;
         }
     }
+
     return false;
 }
 
@@ -595,6 +597,7 @@ static unsigned char *put_i64(unsigned char *bytes, int64_t number)
     for (int i = 0; i < INTEGER_BYTES; i++) {
         bytes[i] = (unsigned char)(bits >> (8 * i));
     }
+
     return bytes + INTEGER_BYTES;
 }
 
@@ -619,6 +622,7 @@ static int write_full(int fd, const unsigned char *bytes, size_t size,
         size -= (size_t)written;
         offset += (uint64_t)written;
     }
+
     return 0;
 }
 
@@ -679,6 +683,7 @@ static int index_next(struct record_iterator *iterator, struct record *record)
         return 0;
     }
     index->found = false;
+
     return scan_next(iterator, record);
 }
 
@@ -699,6 +704,7 @@ static int read_full(int fd, void *bytes, size_t size, uint64_t offset)
         size -= (size_t)read_len;
         offset += (uint64_t)read_len;
     }
+
     return 0;
 }
 
@@ -750,6 +756,7 @@ static uint32_t get_u32(const unsigned char *bytes)
     for (int i = 0; i < LENGTH_BYTES; i++) {
         number |= (uint32_t)bytes[i] << (8 * i);
     }
+
     return number;
 }
 
@@ -760,5 +767,6 @@ static int64_t get_i64(const unsigned char *bytes)
     for (int i = 0; i < INTEGER_BYTES; i++) {
         bits |= (uint64_t)bytes[i] << (8 * i);
     }
+
     return (int64_t)bits;
 }

@@ -228,6 +228,7 @@ static bool count_parse(const char *text, int64_t *count)
         return false;
     }
     *count = parsed;
+
     return true;
 }
 
@@ -273,6 +274,7 @@ static struct engine_result *query_run(struct engine *engine,
     engine_bench_force_scan = way == BENCH_WAY_FORCED_SCAN;
     result = engine_execute(engine, sql, NULL);
     engine_bench_force_scan = false;
+
     return result;
 }
 
@@ -348,6 +350,7 @@ static bool results_are_same(const struct engine_result *left,
             return false;
         }
     }
+
     return true;
 }
 
@@ -359,6 +362,7 @@ static bool values_are_same(const struct value *left, const struct value *right)
     if (left->type == VALUE_INT) {
         return left->integer == right->integer;
     }
+
     return left->text_len == right->text_len &&
            memcmp(left->text, right->text, left->text_len) == 0;
 }

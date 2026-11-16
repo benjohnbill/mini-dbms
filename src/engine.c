@@ -134,6 +134,7 @@ struct engine *engine_create(const char *data_dir,
         engine_destroy(engine);
         return NULL;
     }
+
     return engine;
 }
 
@@ -255,6 +256,7 @@ static int data_dir_lock(struct engine *engine, const char *data_dir,
         }
         return -1;
     }
+
     return 0;
 }
 
@@ -331,6 +333,7 @@ static int table_locks_create(struct engine *engine, char *error,
         }
         engine->table_lock_count++;
     }
+
     return 0;
 }
 
@@ -390,6 +393,7 @@ static int insert_check(struct engine_result *result, const struct table *table,
             return -1;
         }
     }
+
     return 0;
 }
 
@@ -423,6 +427,7 @@ static size_t *select_check(struct engine_result *result,
         free(sources);
         return NULL;
     }
+
     return sources;
 }
 
@@ -509,6 +514,7 @@ static bool table_find(const struct engine *engine, const char *name,
             return true;
         }
     }
+
     return false;
 }
 
@@ -617,6 +623,7 @@ select_iterator_create(struct table *table, const struct statement *statement,
     if (iterator == NULL) {
         result_fail(result, ENGINE_REASON_OUT_OF_MEMORY, "메모리가 부족합니다");
     }
+
     return iterator;
 }
 
@@ -667,6 +674,7 @@ static bool table_find_field(const struct table *table, const char *name,
             return true;
         }
     }
+
     return false;
 }
 
@@ -693,6 +701,7 @@ static int where_check(struct engine_result *result, const struct table *table,
                     value_type_name(type));
         return -1;
     }
+
     return 0;
 }
 
@@ -705,6 +714,7 @@ static enum engine_access_path select_plan(const struct statement *statement,
         !engine_bench_force_scan) {
         return ENGINE_ACCESS_PATH_INDEX;
     }
+
     return ENGINE_ACCESS_PATH_SCAN;
 }
 
@@ -766,6 +776,7 @@ static int result_set_fields(struct engine_result *result,
             return -1;
         }
     }
+
     return 0;
 }
 
@@ -811,6 +822,7 @@ static int result_add_record(struct engine_result *result,
         memcpy(text, source.text, source.text_len);
         text[source.text_len] = '\0';
     }
+
     return 0;
 }
 
@@ -837,6 +849,7 @@ static size_t record_bytes_get(const struct engine_result *result,
         record_bytes +=
             values[i].type == VALUE_TEXT ? values[i].text_len : sizeof(int64_t);
     }
+
     return record_bytes;
 }
 
