@@ -1141,38 +1141,104 @@ static bool text_is_mark(const struct value *value, char prefix, int mark)
            memcmp(value->text, expected, (size_t)expected_len) == 0;
 }
 
-/* SELECT * 결과 하나를 확인합니다. id는 1부터 빈틈없이 이어지고, 각
-   record의 세 field는 같은 mark로 쓴 짝이어야 합니다. 문제가 있으면
-   reader->problem에 적습니다. */
+static void mixed_record_check(struct mixed_reader *reader,
+                               const struct value *record_values,
+                               int64_t expected_id);
+
+/* SELECT * 결과 하나를 확인합니다. id는 1부터 빈틈없이 이어져야 합니다.
+   문제가 있으면 reader->problem에 적습니다. */
 static void mixed_reader_check(struct mixed_reader *reader,
                                const struct engine_result *result)
 {
-    for (size_t i = 0; i < result->record_count; i++) {
-        const struct value *record_values = &result->values[i * 4];
-        int64_t found_id = record_values[0].integer;
-        int mark = (int)record_values[3].integer;
-
-        if (found_id != (int64_t)i + 1 || found_id > MIXED_RECORDS) {
-            snprintf(reader->problem, sizeof(reader->problem),
-                     "record %zu has id %lld", i, (long long)found_id);
-            return;
-        }
-        if (!text_is_mark(&record_values[1], 'n', mark) ||
-            !text_is_mark(&record_values[2], 'e', mark)) {
-            snprintf(reader->problem, sizeof(reader->problem),
-                     "id %lld has fields from different inserts",
-                     (long long)found_id);
-            return;
-        }
-        if (reader->mark_of_id[found_id] != 0 &&
-            reader->mark_of_id[found_id] != mark) {
-            snprintf(reader->problem, sizeof(reader->problem),
-                     "id %lld changed from mark %d to %d", (long long)found_id,
-                     reader->mark_of_id[found_id], mark);
-            return;
-        }
-        reader->mark_of_id[found_id] = mark;
+    for (size_t i = 0; i < result->record_count && reader->problem[0] == '\0';
+         i++) {
+        mixed_record_check(reader, &result->values[i * 4], (int64_t)i + 1);
     }
+}
+
+/* SELECT *의 record 하나를 확인합니다. id는 expected_id이고, 세 field는 같은
+   mark로 쓴 짝이며, 앞서 본 같은 id의 mark와 같아야 합니다. */
+static void mixed_record_check(struct mixed_reader *reader,
+                               const struct value *record_values,
+                               int64_t expected_id)
+{
+    int64_t found_id = record_values[0].integer;
+    int mark = (int)record_values[3].integer;
+
+    if (found_id != expected_id || found_id > MIXED_RECORDS) {
+        snprintf(reader->problem, sizeof(reader->problem),
+                 "expected id %lld, got %lld", (long long)expected_id,
+                 (long long)found_id);
+        return;
+    }
+    if (!text_is_mark(&record_values[1], 'n', mark) ||
+        !text_is_mark(&record_values[2], 'e', mark)) {
+        snprintf(reader->problem, sizeof(reader->problem),
+                 "id %lld has fields from different inserts",
+                 (long long)found_id);
+        return;
+    }
+    if (reader->mark_of_id[found_id] != 0 &&
+        reader->mark_of_id[found_id] != mark) {
+        snprintf(reader->problem, sizeof(reader->problem),
+                 "id %lld changed from mark %d to %d", (long long)found_id,
+                 reader->mark_of_id[found_id], mark);
+        return;
+    }
+    reader->mark_of_id[found_id] = mark;
+}
+
+/* WHERE id = target_id 결과 하나를 확인합니다. INDEX로 0건이나 1건이어야
+   하고, 한 번 본 id가 다시 0건이 되면 안 됩니다. */
+static void index_reader_check(struct mixed_reader *reader,
+                               const struct engine_result *result,
+                               int64_t target_id)
+{
+    if (result->access_path != ENGINE_ACCESS_PATH_INDEX ||
+        result->record_count > 1) {
+        snprintf(reader->problem, sizeof(reader->problem),
+                 "id %lld: path %d, %zu records", (long long)target_id,
+                 (int)result->access_path, result->record_count);
+    } else if (result->record_count == 0) {
+        if (reader->mark_of_id[target_id] != 0) {
+            snprintf(reader->problem, sizeof(reader->problem),
+                     "id %lld disappeared", (long long)target_id);
+        }
+    } else {
+        mixed_record_check(reader, result->values, target_id);
+    }
+}
+
+/* 쓰기가 도는 동안 WHERE id = 1부터 끝까지를 INDEX로 되풀이해 읽습니다. */
+static void *index_reader_main(void *arg)
+{
+    struct mixed_reader *reader = arg;
+    struct mixed_run *run = reader->run;
+    bool writing = true;
+
+    start_gate_wait(&run->gate);
+    while (writing && reader->problem[0] == '\0') {
+        writing = mixed_run_is_writing(run);
+        for (int64_t target_id = 1;
+             target_id <= MIXED_RECORDS && reader->problem[0] == '\0';
+             target_id++) {
+            char sql[SQL_MAX_LEN];
+            struct engine_result *result;
+
+            snprintf(sql, sizeof(sql), "SELECT * FROM users WHERE id = %lld;",
+                     (long long)target_id);
+            result = engine_execute(run->engine, sql, NULL);
+            if (result == NULL || result->status != ENGINE_OK) {
+                snprintf(reader->problem, sizeof(reader->problem),
+                         "SELECT failed");
+            } else {
+                index_reader_check(reader, result, target_id);
+            }
+            engine_result_destroy(result);
+        }
+        reader->selects++;
+    }
+    return NULL;
 }
 
 static void *mixed_reader_main(void *arg)
@@ -1199,7 +1265,9 @@ static void *mixed_reader_main(void *arg)
     return NULL;
 }
 
-static void scan_during_inserts_sees_only_whole_records_test(void)
+/* 쓰기 스레드와 reader_main 읽기 스레드를 함께 돌리고, 쓰기가 받은 id와
+   mark의 짝을 읽기가 본 짝과 견줍니다. */
+static void mixed_run_check(void *(*reader_main)(void *))
 {
     static struct mixed_writer writers[MIXED_WRITERS];
     static struct mixed_reader readers[MIXED_READERS];
@@ -1220,7 +1288,7 @@ static void scan_during_inserts_sees_only_whole_records_test(void)
     }
     for (int i = 0; i < MIXED_READERS; i++) {
         readers[i] = (struct mixed_reader){.run = &run};
-        TEST_ASSERT(pthread_create(&reader_threads[i], NULL, mixed_reader_main,
+        TEST_ASSERT(pthread_create(&reader_threads[i], NULL, reader_main,
                                    &readers[i]) == 0);
     }
     start_gate_open(&run.gate);
@@ -1263,6 +1331,16 @@ static void scan_during_inserts_sees_only_whole_records_test(void)
     }
     engine_destroy(run.engine);
     data_dir_remove();
+}
+
+static void scan_during_inserts_sees_only_whole_records_test(void)
+{
+    mixed_run_check(mixed_reader_main);
+}
+
+static void index_select_during_inserts_sees_only_whole_records_test(void)
+{
+    mixed_run_check(index_reader_main);
 }
 
 /* 첫 호출만 테스트가 놓아 줄 때까지 멈추는 pwrite입니다. 멈춘 동안 그
@@ -1630,6 +1708,10 @@ TEST_LIST = {
     {"[T125] 한 테이블의 INSERT가 쓰기 잠금을 쥐고 멈춰 있어도 다른 테이블의 "
      "INSERT와 SELECT는 기다리지 않는다",
      other_tables_do_not_wait_for_each_other_test},
+    {"[T126] INSERT가 도는 동안 WHERE id = k는 INDEX로 0건이나 온전한 record "
+     "하나를 돌려주고, 한 번 찾은 id는 사라지지 않으며 INSERT가 받은 짝과 "
+     "같다",
+     index_select_during_inserts_sees_only_whole_records_test},
     {"[T100] WHERE id = 7은 INDEX로 그 record 하나만 읽는다",
      where_id_reads_one_record_through_index_test},
     {"[T101] ID가 1~N인 테이블에서 WHERE id = N+1은 INDEX이고 0건이며 "
