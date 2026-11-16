@@ -12,6 +12,7 @@
 #include <sys/file.h>
 #include <unistd.h>
 
+#include "engine_bench.h"
 #include "rwlock.h"
 #include "sql.h"
 #include "table.h"
@@ -19,6 +20,9 @@
 #define SCHEMA_SUFFIX ".schema"
 #define LOCK_FILE_NAME ".lock"
 #define LOCK_PATH_BYTES 1024
+
+/* 측정 전용입니다. 뜻은 engine_bench.h에 있습니다. */
+bool engine_bench_force_scan = false;
 
 /* lock_fd는 잠금 파일을 연 fd이고, 닫으면 잠금이 풀립니다.
    table_locks[i]는 tables[i]의 쓰기 우선 잠금입니다. 테이블 목록은 시작
@@ -547,7 +551,8 @@ static int where_check(struct engine_result *result, const struct table *table,
 static enum engine_access_path select_plan(const struct statement *statement,
                                            size_t where_source)
 {
-    if (statement->where_field != NULL && where_source == 0) {
+    if (statement->where_field != NULL && where_source == 0 &&
+        !engine_bench_force_scan) {
         return ENGINE_ACCESS_PATH_INDEX;
     }
     return ENGINE_ACCESS_PATH_SCAN;

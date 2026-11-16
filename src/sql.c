@@ -54,6 +54,7 @@ static void parser_advance(struct parser *parser);
 static void parser_skip_space(struct parser *parser);
 static void token_read_integer(struct parser *parser);
 static void token_read_string(struct parser *parser);
+static size_t string_span_get(const char *cursor);
 static bool parser_at_symbol(const struct parser *parser, char symbol);
 static bool parser_accept_keyword(struct parser *parser, const char *keyword);
 static void parser_expect_keyword(struct parser *parser, const char *keyword,
@@ -251,7 +252,7 @@ static void token_read_string(struct parser *parser)
 {
     const char *cursor = parser->cursor + 1;
     size_t text_len = 0;
-    char *text = malloc(strlen(cursor) + 1);
+    char *text = malloc(string_span_get(cursor) + 1);
 
     if (text == NULL) {
         parser_fail(parser, SQL_ERROR_NO_MEMORY, "메모리가 부족합니다");
@@ -289,6 +290,23 @@ static void token_read_string(struct parser *parser)
     parser->current.text = text;
     parser->current.length = text_len;
     parser->cursor = cursor + 1;
+}
+
+/* 여는 따옴표 다음부터 닫는 따옴표 앞까지의 바이트 수이고, 읽은 TEXT 값은
+   이보다 길지 않습니다. 남은 SQL 전체가 아니라 이 길이만큼 할당하므로,
+   문자열마다 파일 끝까지 세던 일이 없어 100만 줄 SQL 파일도 줄 수에
+   비례해 읽습니다. 상한을 넘으면 거기서 멈춥니다. */
+static size_t string_span_get(const char *cursor)
+{
+    const char *end = cursor;
+
+    while (*end != '\0' && (size_t)(end - cursor) <= TEXT_MAX_BYTES) {
+        if (*end == '\'' && end[1] != '\'') {
+            break;
+        }
+        end += *end == '\'' ? 2 : 1;
+    }
+    return (size_t)(end - cursor);
 }
 
 static bool parser_at_symbol(const struct parser *parser, char symbol)

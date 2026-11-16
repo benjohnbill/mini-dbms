@@ -28,8 +28,8 @@ LMS는 과제를 세 단계로 나눕니다. 마일스톤은 따로 두지 않�
 | Phase | 만드는 것 | 확인할 것 | 요구사항 | 상태 |
 |---|---|---|---|---|
 | 1 | **SQL 처리기.** 텍스트 파일에 적은 SQL을 CLI로 넘기면 파싱하고 실행합니다. `INSERT`는 테이블 파일에 데이터를 더하고, `SELECT`는 테이블 파일에서 데이터를 읽어 출력합니다. | SQL이 올바르게 파싱되고 실행되는지 | L7\~L19, L35\~L38, L47 | 완료(티켓 01\~05) |
-| 2 | **B+ 트리 인덱스.** 레코드가 추가될 때마다 ID를 자동으로 부여하고, 그 ID를 B+ 트리에 등록합니다. ID로 찾는 `SELECT`는 B+ 트리를 사용합니다. | 레코드 100만 건 이상에서 ID 조회(인덱스 사용)와 다른 필드 조회(처음부터 끝까지 탐색)의 속도 차이 | L20\~L26, L39\~L41, L48 | 진행 중: 티켓 06(B+ 트리 모듈) 완료, 엔진에는 아직 연결 안 됨 |
-| 3 | **API 서버.** 외부 클라이언트가 HTTP로 SQL을 보내면, 스레드 풀이 요청을 나눠 받아 병렬로 처리합니다. | 여러 요청이 동시에 들어와도 결과가 맞는지 | L27\~L30, L42\~L44, L49 | 진행 전 |
+| 2 | **B+ 트리 인덱스.** 레코드가 추가될 때마다 ID를 자동으로 부여하고, 그 ID를 B+ 트리에 등록합니다. ID로 찾는 `SELECT`는 B+ 트리를 사용합니다. | 레코드 100만 건 이상에서 ID 조회(인덱스 사용)와 다른 필드 조회(처음부터 끝까지 탐색)의 속도 차이 | L20\~L26, L39\~L41, L48 | 완료(티켓 06\~08) |
+| 3 | **API 서버.** 외부 클라이언트가 HTTP로 SQL을 보내면, 스레드 풀이 요청을 나눠 받아 병렬로 처리합니다. | 여러 요청이 동시에 들어와도 결과가 맞는지 | L27\~L30, L42\~L44, L49 | 진행 중: 티켓 09, 10 완료, 11\~13 남음 |
 
 요구사항 ID는 [`docs/requirements.md`](docs/requirements.md)에 있습니다. L50(엣지 케이스)은 모든 Phase의 테스트에 들어갑니다. 개발 환경(빌드, 테스트 도구, 코드 규칙 검사, CI)은 준비를 마쳤습니다.
 
@@ -217,7 +217,12 @@ SQL 한 문장이 처리기, 인덱스, 데이터 파일을 지나는 흐름과,
 
 ## 성능 비교
 
-Phase 2의 ID 기준 SELECT(인덱스 사용)와 다른 필드 기준 SELECT(선형 탐색)의 속도 차이를 적습니다. 티켓 08이 결론과 측정 기록 링크를 채웁니다. 측정 기록은 [`docs/measurements/`](docs/measurements/)에 측정 한 번마다 파일 하나로 남깁니다.
+`make bench`가 100만 record를 생성해 CLI로 넣고, 같은 record를 ID 기준 SELECT(INDEX)와 다른 필드 기준 SELECT(SCAN)로 찾아 잽니다.
+
+- **INDEX 대 SCAN:** INDEX는 중앙값 0.8\~1.6 µs, p99 2.5 µs 이하이고, SCAN은 중앙값 567\~857 ms입니다. INDEX는 record 1개를, SCAN은 1,000,000개를 읽습니다. 같은 ID를 강제로 SCAN해도 같은 범위라, 차이는 접근 경로에서 나옵니다. 모든 쌍에서 두 경로의 결과가 같은 record였습니다.
+- **노드 크기:** 16, 32, 64, 128 중 메모리가 가장 적고 삽입이 가장 빠른 128로 정했습니다.
+
+측정 기록: [`docs/measurements/001-CJG-index-vs-scan.md`](docs/measurements/001-CJG-index-vs-scan.md). 측정 기록은 [`docs/measurements/`](docs/measurements/)에 측정 한 번마다 파일 하나로 남깁니다.
 
 ## 알려진 한계
 
@@ -234,25 +239,40 @@ Phase 2의 ID 기준 SELECT(인덱스 사용)와 다른 필드 기준 SELECT(선
 
 ```
 mini-dbms/
-├─ Makefile          make verify, make test, make functional, make lint
+├─ Makefile          make verify, make test, make functional, make lint,
+│                    make tsan, make bench
+├─ LICENSE           GPLv2 (Mongoose를 함께 배포하기 때문)
 ├─ src/
 │  ├─ cli.c          CLI 진입점. SQL 파일을 문장 하나씩 엔진에 넘기고 TSV로 출력, dump 명령
+│  ├─ server.c       API 서버 진입점. Mongoose 이벤트 루프, POST /query, JSON 응답
+│  ├─ work_queue.[ch]  작업 스레드와 작업 대기열
 │  ├─ engine.[ch]    엔진 공개 함수 네 개(engine_create, engine_execute,
-│  │                 engine_result_destroy, engine_destroy), 데이터 폴더 잠금
+│  │                 engine_result_destroy, engine_destroy), 데이터 폴더 잠금,
+│  │                 planner(INDEX 또는 SCAN), 테이블마다 쓰기 우선 잠금
+│  ├─ rwlock.[ch]    쓰기 우선 읽기·쓰기 잠금(mutex와 조건 변수 두 개)
 │  ├─ sql.[ch]       토크나이저와 재귀 하강 파서
 │  ├─ table.[ch]     스키마 파일, 바이너리 테이블 파일, 시작할 때 읽기와 깨진
-│  │                 파일 판정, INSERT 쓰기와 되돌리기, SCAN iterator
+│  │                 파일 판정, INSERT 쓰기와 되돌리기, SCAN과 INDEX iterator
+│  ├─ bptree.[ch]    메모리 B+ 트리(id → 위치)
 │  ├─ value.h        field 값 하나(INT, TEXT)
-│  └─ bptree.[ch]    B+ 트리 모듈(id → 위치). 아직 엔진에 연결하지 않음
+│  ├─ bench.c        측정 프로그램(make bench). 엔진을 직접 링크합니다
+│  └─ engine_bench.h 측정 전용 강제 SCAN 스위치
+├─ vendor/mongoose/  Mongoose 7.23(가져온 코드)
 ├─ tests/
-│  ├─ engine_test.c  엔진 함수 네 개로 확인하는 단위 테스트
-│  ├─ bptree_test.c  B+ 트리 단위 테스트
-│  ├─ acutest.h      단위 테스트 도구(가져온 코드)
+│  ├─ engine_test.c      엔진 함수 네 개로 확인하는 단위 테스트
+│  ├─ bptree_test.c      B+ 트리 단위 테스트
+│  ├─ rwlock_test.c      쓰기 우선 잠금 단위 테스트
+│  ├─ work_queue_test.c  작업 대기열 단위 테스트
+│  ├─ acutest.h          단위 테스트 도구(가져온 코드)
 │  └─ functional/
-│     └─ cli_test.py CLI 실행 파일 기능 테스트
+│     ├─ cli_test.py        CLI 실행 파일 기능 테스트
+│     ├─ server_test.py     API 서버 기능 테스트
+│     └─ generator_test.py  100만 건 생성 스크립트 테스트
 ├─ scripts/
-│  ├─ check-ids.py   테스트 ID와 ADR 이름 검사
-│  └─ convention.py  코드 규칙 검사(make lint)와 자동 수정(make format)
+│  ├─ generate-users.py  시드를 고정한 INSERT 문 SQL 파일 생성
+│  ├─ bench.py           100만 건 적재와 INDEX 대 SCAN 측정(make bench)
+│  ├─ check-ids.py       테스트 ID와 ADR 이름 검사
+│  └─ convention.py      코드 규칙 검사(make lint)와 자동 수정(make format)
 ├─ docs/
 │  ├─ prd/              각자의 PRD 초안(<이니셜>.md), 최종 PRD(final.md), 티켓(issues/)
 │  ├─ requirements.md   LMS 요구사항과 우리 해석

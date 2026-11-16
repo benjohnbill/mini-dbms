@@ -143,6 +143,25 @@ static void failed_reserve_leaves_tree_unchanged_test(void)
     bptree_destroy(tree);
 }
 
+/* 빈 트리는 루트 리프 하나이고, 키 N+1개는 리프 둘과 새 루트 하나입니다. */
+static void stats_count_height_and_nodes_after_root_split_test(void)
+{
+    struct bptree *tree = tree_create_checked();
+    struct bptree_stats empty_stats;
+    struct bptree_stats split_stats;
+
+    bptree_get_stats(tree, &empty_stats);
+    TEST_CHECK(empty_stats.height == 1);
+    TEST_CHECK(empty_stats.node_count == 1);
+    TEST_CHECK(empty_stats.node_bytes > 0);
+    insert_ascending(tree, 1, BPTREE_NODE_KEYS + 1);
+    bptree_get_stats(tree, &split_stats);
+    TEST_CHECK(split_stats.height == 2);
+    TEST_CHECK(split_stats.node_count == 3);
+    TEST_CHECK(split_stats.node_bytes == 3 * empty_stats.node_bytes);
+    bptree_destroy(tree);
+}
+
 TEST_LIST = {
     {"삽입한 키는 그 값과 함께 찾아진다",
      inserted_key_is_found_with_its_value_test},
@@ -160,6 +179,9 @@ TEST_LIST = {
      insert_after_reserve_allocates_nothing_test},
     {"미리 할당이 실패해도 트리는 그대로이고 다음 삽입을 받는다",
      failed_reserve_leaves_tree_unchanged_test},
+    {"[T141] 빈 트리는 높이 1, 노드 1개이고, 키 N+1개를 넣으면 높이 2, "
+     "노드 3개다",
+     stats_count_height_and_nodes_after_root_split_test},
     {NULL, NULL},
 };
 

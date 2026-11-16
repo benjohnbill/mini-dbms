@@ -12,6 +12,7 @@
 #include "acutest.h"
 #include "bptree.h"
 #include "engine.h"
+#include "engine_bench.h"
 #include "table.h"
 
 #define PATH_MAX_LEN 512
@@ -1526,6 +1527,33 @@ static void where_missing_id_reads_no_record_test(void)
     data_dir_remove();
 }
 
+/* 측정 전용 강제 SCAN은 같은 WHERE id = k를 SCAN으로 읽어 INDEX와 같은
+   record를 찾고, 끄면 planner 규칙이 그대로 INDEX를 고릅니다. */
+static void forced_scan_finds_same_record_as_index_test(void)
+{
+    struct engine *engine = users_engine_create();
+    struct engine_result *result;
+
+    users_insert(engine, 10);
+    engine_bench_force_scan = true;
+    result = execute_one(engine, "SELECT * FROM users WHERE id = 7;");
+    engine_bench_force_scan = false;
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_CHECK(result->access_path == ENGINE_ACCESS_PATH_SCAN);
+    TEST_CHECK(result->records_examined == 10);
+    TEST_ASSERT(result->record_count == 1);
+    TEST_CHECK(result->values[0].integer == 7);
+    check_text(&result->values[1], "user7");
+    check_text(&result->values[2], "u7@x");
+    TEST_CHECK(result->values[3].integer == 7);
+    engine_result_destroy(result);
+    check_index_record(execute_one(engine, "SELECT * FROM users WHERE id = 7;"),
+                       7, "user7", "u7@x", 7);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
 static void where_other_field_scans_all_records_test(void)
 {
     struct engine *engine = users_engine_create();
@@ -1791,6 +1819,9 @@ TEST_LIST = {
     {"[T101] ID가 1~N인 테이블에서 WHERE id = N+1은 INDEX이고 0건이며 "
      "record를 읽지 않는다",
      where_missing_id_reads_no_record_test},
+    {"[T140] 측정 전용 강제 SCAN은 WHERE id = k를 SCAN으로 읽어 INDEX와 "
+     "같은 record를 찾고, 끄면 다시 INDEX다",
+     forced_scan_finds_same_record_as_index_test},
     {"[T102] id가 아닌 field의 WHERE는 SCAN이고 모든 record를 읽는다",
      where_other_field_scans_all_records_test},
     {"[T103] WHERE id = 'abc'는 타입 오류이고 record를 읽지 않는다",

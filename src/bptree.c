@@ -51,6 +51,7 @@ static const struct node *leftmost_leaf_find(const struct node *node,
                                              size_t *depth);
 static bool leaf_depths_are_equal(const struct node *node, size_t depth,
                                   size_t expected_depth);
+static size_t node_count_get(const struct node *node);
 
 struct bptree *bptree_create(void)
 {
@@ -162,6 +163,13 @@ bool bptree_is_valid(const struct bptree *tree, size_t expected_key_count)
     }
 
     return key_count == expected_key_count;
+}
+
+void bptree_get_stats(const struct bptree *tree, struct bptree_stats *stats)
+{
+    stats->height = tree->height;
+    stats->node_count = node_count_get(tree->root);
+    stats->node_bytes = stats->node_count * sizeof(struct node);
 }
 
 static struct node *node_allocate(bool is_leaf)
@@ -342,4 +350,17 @@ static bool leaf_depths_are_equal(const struct node *node, size_t depth,
         }
     }
     return true;
+}
+
+/* node와 그 아래 모든 노드의 수입니다. */
+static size_t node_count_get(const struct node *node)
+{
+    size_t count = 1;
+
+    if (!node->is_leaf) {
+        for (size_t i = 0; i <= node->key_count; i++) {
+            count += node_count_get(node->children[i]);
+        }
+    }
+    return count;
 }

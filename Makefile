@@ -15,8 +15,8 @@ LDFLAGS  := -fsanitize=address,undefined -pthread
 
 BUILD    := build
 
-# main이 있는 파일입니다. 나머지 src/*.c는 DB 엔진이며, CLI, 서버, 테스트가 함께 링크합니다.
-MAIN_SRCS := src/cli.c src/server.c
+# main이 있는 파일입니다. 나머지 src/*.c는 DB 엔진이며, CLI, 서버, 측정 프로그램, 테스트가 함께 링크합니다.
+MAIN_SRCS := src/cli.c src/server.c src/bench.c
 LIB_SRCS  := $(filter-out $(MAIN_SRCS),$(wildcard src/*.c))
 LIB_OBJS  := $(LIB_SRCS:src/%.c=$(BUILD)/%.o)
 
@@ -31,7 +31,7 @@ FUNCTIONAL_TESTS = $(filter-out $(SERVER_FUNCTIONAL_TESTS),$(wildcard tests/func
 
 CLI      := $(BUILD)/mini-dbms
 
-.PHONY: all test functional verify tsan lint format clean
+.PHONY: all test functional verify tsan lint format clean bench bench-smoke
 
 all: $(CLI) $(TEST_BINS)
 
@@ -56,9 +56,40 @@ test: $(TEST_BINS)
 functional: $(CLI) functional-server
 	@set -e; for t in $(FUNCTIONAL_TESTS); do echo "== $$t"; python3 -B $$t $(CLI); done
 
-verify: $(CLI) test functional
+verify: $(CLI) test functional bench-smoke
 	python3 scripts/check-ids.py
 	python3 scripts/convention.py lint
+
+# make bench: 100만 record를 생성해 -O2 CLI로 넣고, INDEX 대 SCAN과 노드 크기를
+# 잽니다. 측정용 실행 파일은 sanitizer를 끄고 -O2로 따로 만듭니다. 노드 크기마다
+# -DBPTREE_NODE_KEYS=N으로 엔진을 다시 컴파일합니다(bench-N).
+# bench-smoke는 같은 절차를 작은 record 수로 실행해 make verify가 빠르게 끝나게 합니다.
+BENCH_DIR        := $(BUILD)/bench
+BENCH_CFLAGS     := -std=c11 -Wall -Wextra -Werror -O2 -pthread
+BENCH_NODE_SIZES := 16 32 64 128
+BENCH_RECORDS    ?= 1000000
+BENCH_SEED       ?= 20261116
+BENCH_SMOKE_RECORDS := 2000
+BENCH_BINS := $(BENCH_DIR)/mini-dbms $(BENCH_DIR)/bench \
+              $(BENCH_NODE_SIZES:%=$(BENCH_DIR)/bench-%)
+
+$(BENCH_DIR)/mini-dbms: src/cli.c $(LIB_SRCS) $(wildcard src/*.h) | $(BENCH_DIR)
+	$(CC) $(CPPFLAGS) $(BENCH_CFLAGS) src/cli.c $(LIB_SRCS) -o $@
+
+$(BENCH_DIR)/bench: src/bench.c $(LIB_SRCS) $(wildcard src/*.h) | $(BENCH_DIR)
+	$(CC) $(CPPFLAGS) $(BENCH_CFLAGS) src/bench.c $(LIB_SRCS) -o $@
+
+$(BENCH_DIR)/bench-%: src/bench.c $(LIB_SRCS) $(wildcard src/*.h) | $(BENCH_DIR)
+	$(CC) $(CPPFLAGS) -DBPTREE_NODE_KEYS=$* $(BENCH_CFLAGS) src/bench.c $(LIB_SRCS) -o $@
+
+$(BENCH_DIR):
+	mkdir -p $@
+
+bench: $(BENCH_BINS)
+	python3 -B scripts/bench.py $(BENCH_DIR) $(BENCH_RECORDS) $(BENCH_SEED) $(BENCH_NODE_SIZES)
+
+bench-smoke: $(BENCH_BINS)
+	@python3 -B scripts/bench.py $(BENCH_DIR) $(BENCH_SMOKE_RECORDS) $(BENCH_SEED) $(BENCH_NODE_SIZES) > /dev/null
 
 # make tsan: ThreadSanitizer 빌드로 동시성 테스트를 돌립니다. TSan은 ASan과 함께
 # 켤 수 없어 build/tsan/에 따로 빌드합니다. 경고가 하나라도 나오면 실패로 끝납니다.
