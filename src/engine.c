@@ -47,8 +47,19 @@ static struct engine_result *execute_statement(struct engine *engine,
                                                const char *sql,
                                                const char **next_sql,
                                                const uint64_t *cursor);
+static void execute_on_table(const struct engine *engine, size_t table_index,
+                             const struct statement *statement,
+                             const uint64_t *cursor,
+                             struct engine_result *result);
+static int insert_check(struct engine_result *result, const struct table *table,
+                        const struct statement *statement);
+static size_t *select_check(struct engine_result *result,
+                            const struct table *table,
+                            const struct statement *statement,
+                            const uint64_t *cursor, size_t *where_source);
 static void execute_locked(const struct engine *engine, size_t table_index,
                            const struct statement *statement,
+                           const size_t *sources, size_t where_source,
                            const uint64_t *cursor,
                            struct engine_result *result);
 static void result_fail(struct engine_result *result,
@@ -64,6 +75,7 @@ static void execute_insert(struct table *table,
 static void execute_select(struct table *table,
                            const struct engine_options *options,
                            const struct statement *statement,
+                           const size_t *sources, size_t where_source,
                            const uint64_t *cursor,
                            struct engine_result *result);
 static struct record_iterator *
@@ -180,7 +192,7 @@ static struct engine_result *execute_statement(struct engine *engine,
         result_fail(result, ENGINE_REASON_INVALID_CURSOR,
                     "INSERT에는 커서를 붙이지 않습니다");
     } else if (engine_find_table(engine, statement->table, &table_index)) {
-        execute_locked(engine, table_index, statement, cursor, result);
+        execute_on_table(engine, table_index, statement, cursor, result);
     } else {
         result_fail(result, ENGINE_REASON_NO_TABLE, "없는 테이블입니다: %s",
                     statement->table);
@@ -324,6 +336,89 @@ static int engine_init_table_locks(struct engine *engine, char *error,
     return 0;
 }
 
+/* 검증은 잠금 밖에서 하고 실행 단계만 잠금 안에서 합니다. 스키마는 시작
+   뒤에 바뀌지 않으므로 검증에는 잠금이 필요 없습니다. */
+static void execute_on_table(const struct engine *engine, size_t table_index,
+                             const struct statement *statement,
+                             const uint64_t *cursor,
+                             struct engine_result *result)
+{
+    const struct table *table = engine->tables[table_index];
+    size_t *sources;
+    size_t where_source = 0;
+
+    if (statement->kind == STATEMENT_INSERT) {
+        result->kind = ENGINE_STATEMENT_INSERT;
+        if (insert_check(result, table, statement) == 0) {
+            execute_locked(engine, table_index, statement, NULL, 0, cursor,
+                           result);
+        }
+        return;
+    }
+    result->kind = ENGINE_STATEMENT_SELECT;
+    sources = select_check(result, table, statement, cursor, &where_source);
+    if (sources != NULL) {
+        execute_locked(engine, table_index, statement, sources, where_source,
+                       cursor, result);
+    }
+    free(sources);
+}
+
+/* 값 개수와 타입을 스키마와 맞춥니다. 틀리면 result에 오류를 씁니다. */
+static int insert_check(struct engine_result *result, const struct table *table,
+                        const struct statement *statement)
+{
+    if (statement->value_count != table->field_count) {
+        result_fail(
+            result, ENGINE_REASON_VALUE_COUNT,
+            "%s에는 값 %zu개가 와야 하는데 %zu개입니다(id는 적지 않습니다)",
+            table->name, table->field_count, statement->value_count);
+        return -1;
+    }
+    for (size_t i = 0; i < table->field_count; i++) {
+        if (statement->values[i].type != table->fields[i].type) {
+            result_fail(
+                result, ENGINE_REASON_TYPE, "%s field에는 %s 값이 와야 합니다",
+                table->fields[i].name, value_type_name(table->fields[i].type));
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* SELECT의 field와 WHERE를 스키마와 맞추고 접근 경로를 정합니다. 통과하면
+   결과 field마다 record 안의 위치를 담은 배열을 돌려주고, 부르는 쪽이
+   해제합니다. 실패하면 result에 오류를 쓰고 NULL입니다. 커서가 record
+   시작인지는 테이블 파일을 읽어야 하므로 실행 단계에서 봅니다. */
+static size_t *select_check(struct engine_result *result,
+                            const struct table *table,
+                            const struct statement *statement,
+                            const uint64_t *cursor, size_t *where_source)
+{
+    size_t source_count = statement->field_count == 0 ? table->field_count + 1
+                                                      : statement->field_count;
+    size_t *sources = calloc(source_count, sizeof(*sources));
+
+    if (sources == NULL) {
+        result_fail(result, ENGINE_REASON_OUT_OF_MEMORY, "메모리가 부족합니다");
+        return NULL;
+    }
+    if (result_set_fields(result, table, statement, sources) != 0 ||
+        where_check(result, table, statement, where_source) != 0) {
+        free(sources);
+        return NULL;
+    }
+    result->access_path = select_plan(statement, *where_source);
+    if (cursor != NULL && result->access_path == ENGINE_ACCESS_PATH_INDEX) {
+        /* INDEX 결과는 많아야 1건이라 나눌 일이 없습니다. */
+        result_fail(result, ENGINE_REASON_INVALID_CURSOR,
+                    "id = 정수 조건의 SELECT에는 커서를 붙이지 않습니다");
+        free(sources);
+        return NULL;
+    }
+    return sources;
+}
+
 /* 실행 단계 전체를 테이블의 잠금 안에서 합니다. SELECT는 읽기 잠금,
    INSERT는 쓰기 잠금입니다. ID 발급, 파일 쓰기, 트리 등록, 실패 시
    되돌리기가 모두 이 쓰기 잠금 안에 들어가므로, 그 아래 함수는 잠금을 다시
@@ -331,6 +426,7 @@ static int engine_init_table_locks(struct engine *engine, char *error,
    안에서 읽습니다. */
 static void execute_locked(const struct engine *engine, size_t table_index,
                            const struct statement *statement,
+                           const size_t *sources, size_t where_source,
                            const uint64_t *cursor, struct engine_result *result)
 {
     struct table *table = engine->tables[table_index];
@@ -350,7 +446,8 @@ static void execute_locked(const struct engine *engine, size_t table_index,
     } else if (writes) {
         execute_insert(table, statement, result);
     } else {
-        execute_select(table, &engine->options, statement, cursor, result);
+        execute_select(table, &engine->options, statement, sources,
+                       where_source, cursor, result);
     }
     if (writes) {
         rwlock_write_unlock(lock);
@@ -408,30 +505,12 @@ static bool engine_find_table(const struct engine *engine, const char *name,
     return false;
 }
 
-/* 값 개수와 타입을 스키마와 먼저 맞춘 뒤에 파일에 씁니다. */
+/* insert_check를 통과한 값을 파일에 씁니다. */
 static void execute_insert(struct table *table,
                            const struct statement *statement,
                            struct engine_result *result)
 {
-    enum table_insert_status insert_status;
-
-    result->kind = ENGINE_STATEMENT_INSERT;
-    if (statement->value_count != table->field_count) {
-        result_fail(
-            result, ENGINE_REASON_VALUE_COUNT,
-            "%s에는 값 %zu개가 와야 하는데 %zu개입니다(id는 적지 않습니다)",
-            table->name, table->field_count, statement->value_count);
-        return;
-    }
-    for (size_t i = 0; i < table->field_count; i++) {
-        if (statement->values[i].type != table->fields[i].type) {
-            result_fail(
-                result, ENGINE_REASON_TYPE, "%s field에는 %s 값이 와야 합니다",
-                table->fields[i].name, value_type_name(table->fields[i].type));
-            return;
-        }
-    }
-    insert_status =
+    enum table_insert_status insert_status =
         table_insert(table, statement->values, &result->inserted_id,
                      result->error_message, sizeof(result->error_message));
     if (insert_status != TABLE_INSERT_OK) {
@@ -464,29 +543,16 @@ insert_error_reason(enum table_insert_status insert_status)
 static void execute_select(struct table *table,
                            const struct engine_options *options,
                            const struct statement *statement,
+                           const size_t *sources, size_t where_source,
                            const uint64_t *cursor, struct engine_result *result)
 {
     size_t result_bytes = 0;
-    size_t source_count = statement->field_count == 0 ? table->field_count + 1
-                                                      : statement->field_count;
-    size_t *sources = calloc(source_count, sizeof(*sources));
-    struct record_iterator *iterator = NULL;
+    struct record_iterator *iterator =
+        select_iterator_create(table, statement, cursor, result);
     struct record record;
-    size_t where_source = 0;
     int status;
 
-    result->kind = ENGINE_STATEMENT_SELECT;
-    if (sources == NULL) {
-        result_fail(result, ENGINE_REASON_OUT_OF_MEMORY, "메모리가 부족합니다");
-        return;
-    }
-    if (result_set_fields(result, table, statement, sources) == 0 &&
-        where_check(result, table, statement, &where_source) == 0) {
-        result->access_path = select_plan(statement, where_source);
-        iterator = select_iterator_create(table, statement, cursor, result);
-    }
     if (iterator == NULL) {
-        free(sources);
         return;
     }
     while ((status = iterator->next(iterator, &record)) == 1) {
@@ -512,7 +578,6 @@ static void execute_select(struct table *table,
         }
     }
     iterator->destroy(iterator);
-    free(sources);
     if (status == 1) {
         select_part_end(result, options, &record);
         return;
@@ -533,12 +598,6 @@ select_iterator_create(struct table *table, const struct statement *statement,
 {
     struct record_iterator *iterator;
 
-    if (cursor != NULL && result->access_path == ENGINE_ACCESS_PATH_INDEX) {
-        /* INDEX 결과는 많아야 1건이라 나눌 일이 없습니다. */
-        result_fail(result, ENGINE_REASON_INVALID_CURSOR,
-                    "id = 정수 조건의 SELECT에는 커서를 붙이지 않습니다");
-        return NULL;
-    }
     if (cursor != NULL && !cursor_is_valid(table, *cursor)) {
         result_fail(result, ENGINE_REASON_INVALID_CURSOR,
                     "커서 %llu는 record가 시작하는 위치가 아닙니다",

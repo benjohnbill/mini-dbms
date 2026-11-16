@@ -582,6 +582,36 @@ static void failed_rollback_stops_table_test(void)
     data_dir_remove();
 }
 
+static void stopped_table_still_reports_validation_errors_test(void)
+{
+    struct engine *engine = users_engine_create();
+    struct engine_result *result;
+
+    table_file_functions.write_at = part_then_fail_pwrite;
+    table_file_functions.truncate = failing_ftruncate;
+    check_table_unavailable(
+        execute_one(engine, "INSERT INTO users VALUES ('lee', 'l@x', 31);"));
+    table_file_functions.write_at = pwrite;
+    table_file_functions.truncate = ftruncate;
+
+    result = execute_one(engine, "INSERT INTO users VALUES ('kim', 'k@x');");
+    TEST_CHECK(result->error_reason == ENGINE_REASON_VALUE_COUNT);
+    engine_result_destroy(result);
+    result =
+        execute_one(engine, "INSERT INTO users VALUES ('kim', 'k@x', 'x');");
+    TEST_CHECK(result->error_reason == ENGINE_REASON_TYPE);
+    engine_result_destroy(result);
+    result = execute_one(engine, "SELECT nickname FROM users;");
+    TEST_CHECK(result->error_reason == ENGINE_REASON_NO_FIELD);
+    engine_result_destroy(result);
+    result = execute_one(engine, "SELECT * FROM users WHERE age = 'x';");
+    TEST_CHECK(result->error_reason == ENGINE_REASON_TYPE);
+    engine_result_destroy(result);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
 static void stopped_table_leaves_other_tables_working_test(void)
 {
     struct engine *engine = users_and_items_engine_create();
@@ -1861,6 +1891,9 @@ TEST_LIST = {
     {"[T81] 되돌리기도 실패하면 그 INSERT와 이후 같은 테이블의 SELECT, "
      "INSERT가 모두 table_unavailable이다",
      failed_rollback_stops_table_test},
+    {"멈춘 테이블에도 값 개수, 타입, 없는 field 오류는 table_unavailable "
+     "대신 검증 오류로 온다",
+     stopped_table_still_reports_validation_errors_test},
     {"[T82] 한 테이블이 멈춰도 다른 테이블의 INSERT와 SELECT는 성공한다",
      stopped_table_leaves_other_tables_working_test},
     {"[T83] 쓰기가 실패하고 되돌린 뒤의 SELECT는 재시작 전후 모두 실패 "

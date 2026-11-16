@@ -250,15 +250,18 @@ main                                [이벤트 루프 스레드]
                                ▼
 엔진 (src/engine.c)  execute_statement
  ├ sql_parse (src/sql.c)                       잠금 밖: 토크나이저, 파서
- └ engine_find_table → execute_locked
-    ├ rwlock_write_lock / rwlock_read_lock     테이블마다 쓰기 우선 잠금
-    │                                          (src/rwlock.c)
-    ├ INSERT: execute_insert → table_insert (src/table.c)
-    │          bptree_reserve → write_full(pwrite) → bptree_insert
-    │          → committed_size 올림. 쓰기 실패면 ftruncate로 되돌림
-    └ SELECT: execute_select → select_plan
-               ├ INDEX: table_index_create → bptree_find → record 1개 pread
-               └ SCAN:  table_scan_create(cursor) → scan_next(pread)
+ └ engine_find_table → execute_on_table
+    ├ insert_check / select_check → select_plan
+    │                                          잠금 밖: 스키마 검증, 접근 경로
+    └ execute_locked
+       ├ rwlock_write_lock / rwlock_read_lock  테이블마다 쓰기 우선 잠금
+       │                                       (src/rwlock.c)
+       ├ INSERT: execute_insert → table_insert (src/table.c)
+       │          bptree_reserve → write_full(pwrite) → bptree_insert
+       │          → committed_size 올림. 쓰기 실패면 ftruncate로 되돌림
+       └ SELECT: execute_select → select_iterator_create
+                  ├ INDEX: table_index_create → bptree_find → record 1개 pread
+                  └ SCAN:  table_scan_create(cursor) → scan_next(pread)
                                ▼
 데이터 폴더: <테이블>.schema, <테이블>.tbl, .lock
 
