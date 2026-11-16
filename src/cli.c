@@ -133,14 +133,14 @@ static int table_dump(struct engine *engine, const char *table_name)
     snprintf(sql, sizeof(sql), "SELECT * FROM %s;", table_name);
     result = engine_execute(engine, sql, &next_sql);
     if (result == NULL) {
-        fprintf(stderr, "out of memory\n");
+        fprintf(stderr, "메모리가 부족합니다\n");
         return EXIT_FAILURE;
     }
     if (result->status != ENGINE_OK) {
-        fprintf(stderr, "error: %s\n", result->error_message);
+        fprintf(stderr, "오류: %s\n", result->error_message);
         status = EXIT_FAILURE;
     } else if (*next_sql != '\0') {
-        fprintf(stderr, "error: bad table name: %s\n", table_name);
+        fprintf(stderr, "오류: 잘못된 테이블 이름입니다: %s\n", table_name);
         status = EXIT_FAILURE;
     } else {
         result_print(result);
@@ -209,7 +209,7 @@ static int sql_run(struct engine *engine, const char *sql, bool quiet)
         elapsed_ms = elapsed_ms_get(&start);
 
         if (result == NULL) {
-            fprintf(stderr, "out of memory\n");
+            fprintf(stderr, "메모리가 부족합니다\n");
             return EXIT_FAILURE;
         }
         if (result->status == ENGINE_OK) {

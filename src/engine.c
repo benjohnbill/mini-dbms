@@ -250,7 +250,7 @@ static int data_dir_lock(struct engine *engine, const char *data_dir,
     if (flock(engine->lock_fd, LOCK_EX | LOCK_NB) != 0) {
         if (errno == EWOULDBLOCK) {
             snprintf(error, error_size,
-                     "%s: data folder is in use by another process", data_dir);
+                     "%s: 다른 프로세스가 쓰는 데이터 폴더입니다", data_dir);
         } else {
             snprintf(error, error_size, "%s: %s", path, strerror(errno));
         }
@@ -454,7 +454,7 @@ static void execute_locked(const struct engine *engine, size_t table_index,
         /* 되돌리기가 실패한 테이블은 파일 상태를 알 수 없으므로 읽지도
            쓰지도 않습니다. 재시작하면 시작할 때 읽기가 파일을 판정합니다. */
         result_fail(result, ENGINE_REASON_TABLE_UNAVAILABLE,
-                    "%s: table is unavailable until restart", table->name);
+                    "%s: 재시작할 때까지 쓸 수 없는 테이블입니다", table->name);
     } else if (writes) {
         execute_insert(table, statement, result);
     } else {

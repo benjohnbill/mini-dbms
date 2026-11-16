@@ -98,7 +98,7 @@ struct table *table_create(const char *data_dir, const char *name, char *error,
     struct stat file_stat;
 
     if (table == NULL) {
-        error_set(error, error_size, "out of memory");
+        error_set(error, error_size, "메모리가 부족합니다");
         return NULL;
     }
     table->fd = -1;
@@ -157,7 +157,7 @@ enum table_insert_status table_insert(struct table *table,
     int write_errno;
 
     if (table->last_id == INT64_MAX) {
-        error_set(error, error_size, "%s: id reached the INT maximum",
+        error_set(error, error_size, "%s: ID가 INT 최댓값에 닿았습니다",
                   table->name);
         return TABLE_INSERT_ID_EXHAUSTED;
     }
@@ -166,12 +166,12 @@ enum table_insert_status table_insert(struct table *table,
        3단계의 트리 삽입이 쓸 노드입니다. */
     bytes = table_file_functions.allocate(size);
     if (bytes == NULL) {
-        error_set(error, error_size, "out of memory");
+        error_set(error, error_size, "메모리가 부족합니다");
         return TABLE_INSERT_OUT_OF_MEMORY;
     }
     if (bptree_reserve(table->tree) != 0) {
         free(bytes);
-        error_set(error, error_size, "out of memory");
+        error_set(error, error_size, "메모리가 부족합니다");
         return TABLE_INSERT_OUT_OF_MEMORY;
     }
     record_encode(table, new_id, values, bytes);
@@ -184,8 +184,9 @@ enum table_insert_status table_insert(struct table *table,
                                           (off_t)table->committed_size) != 0) {
             table->available = false;
             error_set(error, error_size,
-                      "%s.tbl: write failed (%s) and rollback failed (%s); "
-                      "unknown whether this INSERT was saved",
+                      "%s.tbl: 쓰기가 실패했고(%s) 되돌리기도 "
+                      "실패했습니다(%s). 이 INSERT가 저장됐는지 알 수 "
+                      "없습니다",
                       table->name, strerror(write_errno), strerror(errno));
             return TABLE_INSERT_UNAVAILABLE;
         }
@@ -295,7 +296,7 @@ static int schema_load(struct table *table, const char *path, char *error,
     free(line);
     fclose(file);
     if (status == 0 && table->field_count == 0) {
-        error_set(error, error_size, "%s: no fields", path);
+        error_set(error, error_size, "%s: field가 없습니다", path);
         status = -1;
     }
 
@@ -318,37 +319,40 @@ static int schema_add_field(struct table *table, const char *line,
         return 0;
     }
     if (matched != 2) {
-        error_set(error, error_size, "%s.schema: line %d: expected `name TYPE`",
+        error_set(error, error_size,
+                  "%s.schema: %d번째 줄: `이름 타입` 형식이 아닙니다",
                   table->name, line_number);
         return -1;
     }
     if (schema_type_parse(type_name, &type) != 0) {
-        error_set(error, error_size, "%s.schema: line %d: unsupported type %s",
+        error_set(error, error_size,
+                  "%s.schema: %d번째 줄: 지원하지 않는 타입입니다: %s",
                   table->name, line_number, type_name);
         return -1;
     }
     if (strcmp(name, "id") == 0) {
         error_set(error, error_size,
-                  "%s.schema: line %d: id is added by the engine", table->name,
-                  line_number);
+                  "%s.schema: %d번째 줄: id는 엔진이 붙이므로 적지 않습니다",
+                  table->name, line_number);
         return -1;
     }
     if (schema_has_field(table, name)) {
-        error_set(error, error_size, "%s.schema: line %d: duplicate field %s",
+        error_set(error, error_size,
+                  "%s.schema: %d번째 줄: 이미 있는 field입니다: %s",
                   table->name, line_number, name);
         return -1;
     }
     fields = realloc(table->fields,
                      (table->field_count + 1) * sizeof(*table->fields));
     if (fields == NULL) {
-        error_set(error, error_size, "out of memory");
+        error_set(error, error_size, "메모리가 부족합니다");
         return -1;
     }
     table->fields = fields;
     fields[table->field_count].name = strdup(name);
     fields[table->field_count].type = type;
     if (fields[table->field_count].name == NULL) {
-        error_set(error, error_size, "out of memory");
+        error_set(error, error_size, "메모리가 부족합니다");
         return -1;
     }
     table->field_count++;
@@ -394,7 +398,7 @@ static int table_records_load(struct table *table, const char *path,
 
     if (status != 0) {
         error_set(error, error_size, "%s: %s", path,
-                  errno != 0 ? strerror(errno) : "cannot read records");
+                  errno != 0 ? strerror(errno) : "record를 읽지 못했습니다");
         return -1;
     }
     if (damage.kind != NULL) {

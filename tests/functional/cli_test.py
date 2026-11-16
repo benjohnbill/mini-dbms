@@ -297,7 +297,7 @@ def locked_data_dir_exits_1_until_lock_is_released():
             fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
             proc = run_sql(data_dir, "SELECT * FROM users;")
             assert proc.returncode == 1, proc.returncode
-            assert b"in use" in proc.stderr, proc.stderr
+            assert "다른 프로세스가 쓰는".encode("utf-8") in proc.stderr, proc.stderr
         proc = run_sql(data_dir, "SELECT * FROM users;")
         assert proc.returncode == 0, proc.stderr
     finally:

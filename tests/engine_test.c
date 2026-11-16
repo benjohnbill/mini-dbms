@@ -424,7 +424,7 @@ static void second_engine_on_locked_folder_fails_test(void)
     struct engine *second = engine_create(data_dir, NULL, error, sizeof(error));
 
     TEST_CHECK(second == NULL);
-    TEST_CHECK(strstr(error, "in use") != NULL);
+    TEST_CHECK(strstr(error, "다른 프로세스가 쓰는") != NULL);
     TEST_MSG("error: %s", error);
     engine_destroy(second);
     engine_destroy(first);
@@ -440,8 +440,8 @@ static void bad_schema_stops_engine_create_test(void)
         const char *schema;
         const char *expected_error;
     } cases[] = {
-        {"name TEXT\nbroken\n", "line 2"},
-        {"name TEXT\nage INT extra\n", "line 2"},
+        {"name TEXT\nbroken\n", "2번째 줄"},
+        {"name TEXT\nage INT extra\n", "2번째 줄"},
         {"name TEXT\nname INT\n", "name"},
         {"name VARCHAR\n", "VARCHAR"},
         {"id INT\nname TEXT\n", "id"},
@@ -512,7 +512,7 @@ static void insert_after_max_id_fails_and_keeps_file_test(void)
     result = execute_one(engine, "INSERT INTO ages VALUES (9);");
     TEST_CHECK(result->status == ENGINE_ERROR);
     TEST_CHECK(result->error_reason == ENGINE_REASON_ID_EXHAUSTED);
-    TEST_CHECK(strstr(result->error_message, "id") != NULL);
+    TEST_CHECK(strstr(result->error_message, "ID") != NULL);
     TEST_MSG("error: %s", result->error_message);
     engine_result_destroy(result);
     TEST_CHECK(file_size_get("ages.tbl") == 40);
@@ -571,7 +571,7 @@ static void failed_rollback_stops_table_test(void)
         execute_one(engine, "INSERT INTO users VALUES ('lee', 'l@x', 31);");
     table_file_functions.write_at = pwrite;
     table_file_functions.truncate = ftruncate;
-    TEST_CHECK(strstr(result->error_message, "unknown whether") != NULL);
+    TEST_CHECK(strstr(result->error_message, "알 수 없습니다") != NULL);
     check_table_unavailable(result);
 
     check_table_unavailable(execute_one(engine, "SELECT * FROM users;"));
