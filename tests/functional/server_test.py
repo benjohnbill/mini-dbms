@@ -29,6 +29,15 @@ REQUEST_TIMEOUT = 10.0
 CONCURRENT_INSERTS = 100
 BODY_MAX = 1 << 20
 IDLE_TIMEOUT_MS = 300
+# 종료 테스트의 긴 SCAN이 읽을 record 수입니다. SCAN 하나가 1초쯤 걸려, SIGINT를 보내고 서버의
+# 반응을 확인하는 동안 작업이 아직 실행 중입니다.
+FILLER_RECORDS = 1_000_000
+LONG_SCAN = "SELECT name FROM users WHERE age = 7;"
+# 서버가 보낸 바이트를 읽었는지, 작업 스레드가 작업을 꺼냈는지는 바깥에서 볼 수 없어 이만큼
+# 기다립니다. 긴 SCAN이 이 시간보다 몇 배 깁니다.
+SETTLE = 0.2
+SHUTDOWN_WAIT_MS = 1000
+STOPPED_ACCEPTING = "stopped accepting connections"
 SANITIZER_MARKS = ("WARNING: ThreadSanitizer", "ERROR: AddressSanitizer", "ERROR: LeakSanitizer", "runtime error:")
 
 
@@ -42,13 +51,17 @@ def users_record_bytes(new_id, name, email, age):
     return len(body).to_bytes(4, "little") + body
 
 
-def make_data_dir(records=()):
-    """records는 테이블 파일에 미리 써 둘 (name, email, age)들이고, ID는 1부터 붙습니다."""
+def make_data_dir(records=(), filler_count=0):
+    """records는 테이블 파일에 미리 써 둘 (name, email, age)들이고, ID는 1부터 붙습니다. 그 뒤에
+    ('n', 'e', 2) record를 filler_count개 붙입니다."""
     data_dir = tempfile.mkdtemp(prefix="mini-dbms-server-")
     with open(os.path.join(data_dir, "users.schema"), "w", encoding="utf-8") as f:
         f.write(USERS_SCHEMA)
     with open(os.path.join(data_dir, "users.tbl"), "wb") as f:
         f.write(b"".join(users_record_bytes(i, *record) for i, record in enumerate(records, 1)))
+        filler = users_record_bytes(0, "n", "e", 2)
+        f.write(b"".join(filler[:4] + i.to_bytes(8, "little") + filler[12:]
+                         for i in range(len(records) + 1, len(records) + filler_count + 1)))
     return data_dir
 
 
@@ -61,8 +74,10 @@ def free_port():
 class Server:
     """with 문 안에서만 서버가 돕니다. 나갈 때 서버를 끄고 데이터 폴더를 지웁니다."""
 
-    def __init__(self, extra_args=(), preexec_fn=None, records=()):
-        self.data_dir = make_data_dir(records)
+    def __init__(self, extra_args=(), preexec_fn=None, records=(), filler_count=0, data_dir=None):
+        """data_dir을 주면 그 폴더로 띄우고, 나갈 때 지우지 않습니다."""
+        self.owns_data_dir = data_dir is None
+        self.data_dir = make_data_dir(records, filler_count) if data_dir is None else data_dir
         self.port = free_port()
         self.log = tempfile.TemporaryFile()
         self.process = subprocess.Popen(
@@ -91,7 +106,8 @@ class Server:
             except subprocess.TimeoutExpired:
                 self.process.kill()
                 self.process.wait()
-        shutil.rmtree(self.data_dir, ignore_errors=True)
+        if self.owns_data_dir:
+            shutil.rmtree(self.data_dir, ignore_errors=True)
         output = self.output()
         self.log.close()
         if exc[0] is None:
@@ -100,6 +116,23 @@ class Server:
     def output(self):
         self.log.seek(0)
         return self.log.read().decode("utf-8", "replace")
+
+    def interrupt(self):
+        self.process.send_signal(signal.SIGINT)
+
+    def wait_output(self, text):
+        """서버 출력에 text가 나올 때까지 기다립니다."""
+        deadline = time.monotonic() + STOP_TIMEOUT
+        while text not in self.output():
+            assert time.monotonic() < deadline, f"서버 출력에 {text!r}가 없습니다: {self.output()}"
+            time.sleep(0.02)
+
+    def wait_exit(self):
+        """서버가 끝나기를 기다려 종료 코드를 돌려줍니다."""
+        try:
+            return self.process.wait(timeout=STOP_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise AssertionError(f"서버가 {STOP_TIMEOUT}초 안에 끝나지 않았습니다") from None
 
     def request(self, method, path, body=None):
         """(상태 코드, 헤더 dict, 본문 JSON)을 돌려줍니다."""
@@ -470,6 +503,97 @@ def insert_whose_client_left_is_still_stored():
         assert [record[1] for record in server.records()] == ["a"]
 
 
+def interrupted_server_finishes_received_requests_and_restarts():
+    data_dir = make_data_dir([("a", "e", 7), ("b", "e", 7)], FILLER_RECORDS)
+    try:
+        with Server(extra_args=["--threads", "1"], data_dir=data_dir) as server:
+            with server.raw() as scan_client, server.raw() as insert_client:
+                scan_client.send(post(LONG_SCAN))
+                time.sleep(SETTLE)
+                insert_client.send(post("INSERT INTO users VALUES ('c', 'e', 7);"))
+                time.sleep(SETTLE)
+                server.interrupt()
+                status, _, body = scan_client.response()
+                assert (status, body["records"]) == (200, [["a"], ["b"]]), body
+                assert body["records_examined"] == FILLER_RECORDS + 2, body
+                status, _, body = insert_client.response()
+                assert (status, body) == (200, {"inserted": 1, "id": FILLER_RECORDS + 3}), body
+            assert server.wait_exit() == 0, server.output()
+        with Server(data_dir=data_dir) as server:
+            status, body = server.query("SELECT name FROM users WHERE age = 7;")
+            assert body["records"] == [["a"], ["b"], ["c"]], body
+    finally:
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def interrupted_server_refuses_new_connections_and_keep_alive_requests():
+    with Server(extra_args=["--threads", "1"], filler_count=FILLER_RECORDS) as server:
+        with server.raw() as kept_client, server.raw() as scan_client:
+            kept_client.send(post("INSERT INTO users VALUES ('k', 'e', 7);"))
+            assert kept_client.response()[0] == 200
+            scan_client.send(post(LONG_SCAN))
+            time.sleep(SETTLE)
+            server.interrupt()
+            server.wait_output(STOPPED_ACCEPTING)
+            try:
+                socket.create_connection((HOST, server.port), timeout=1.0).close()
+                raise AssertionError("SIGINT 뒤에 새 연결이 받아졌습니다")
+            except ConnectionRefusedError:
+                pass
+            kept_client.send(post("INSERT INTO users VALUES ('z', 'e', 7);"))
+            status, headers, body = kept_client.response()
+            assert (status, body["error"]) == (503, "shutting_down"), body
+            assert headers.get("connection") == "close", headers
+            assert kept_client.is_closed()
+            assert scan_client.response()[2]["records"] == [["k"]]
+        assert server.wait_exit() == 0, server.output()
+
+
+def unread_reply_delays_shutdown_only_for_the_wait():
+    records = [("x" * 1000, "e", 1)] * 5000
+    with Server(extra_args=["--shutdown-wait", str(SHUTDOWN_WAIT_MS)], records=records) as server:
+        sock = socket.socket()
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        sock.connect((HOST, server.port))
+        try:
+            sock.sendall(post("SELECT * FROM users;"))
+            # 응답의 첫 바이트가 오면 작업은 끝났고 응답은 송신 버퍼에 있습니다.
+            assert sock.recv(1) == b"H"
+            started = time.monotonic()
+            server.interrupt()
+            assert server.wait_exit() == 0, server.output()
+            elapsed = time.monotonic() - started
+        finally:
+            sock.close()
+        assert SHUTDOWN_WAIT_MS / 1000 <= elapsed < SHUTDOWN_WAIT_MS / 1000 + 2, elapsed
+
+
+def second_interrupt_keeps_running_insert_and_drops_queued_one():
+    data_dir = make_data_dir(filler_count=FILLER_RECORDS)
+    try:
+        with Server(extra_args=["--threads", "2"], data_dir=data_dir) as server:
+            with server.raw() as scan_client, server.raw() as running_client, \
+                    server.raw() as queued_client:
+                # 긴 SCAN이 읽기 잠금을 쥔 동안 두 번째 스레드의 INSERT는 쓰기 잠금을 기다리며
+                # 실행 중이고, 스레드가 없는 마지막 INSERT는 대기열에만 있습니다.
+                scan_client.send(post(LONG_SCAN))
+                time.sleep(SETTLE)
+                running_client.send(post("INSERT INTO users VALUES ('running', 'e', 7);"))
+                time.sleep(SETTLE)
+                queued_client.send(post("INSERT INTO users VALUES ('queued', 'e', 7);"))
+                time.sleep(SETTLE)
+                server.interrupt()
+                server.wait_output(STOPPED_ACCEPTING)
+                server.interrupt()
+                assert server.wait_exit() == 0, server.output()
+                assert queued_client.response() is None
+        with Server(data_dir=data_dir) as server:
+            status, body = server.query("SELECT name FROM users WHERE age = 7;")
+            assert body["records"] == [["running"]], body
+    finally:
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
 TESTS = [
     ("[T163] INSERT는 200과 발급된 id를 받고, 같은 id의 SELECT는 INDEX로 그 record를 돌려준다",
      insert_returns_id_and_select_by_id_uses_index),
@@ -514,6 +638,17 @@ TESTS = [
      idle_connection_is_closed_after_timeout),
     ("[T211] 응답을 받기 전에 연결을 끊은 INSERT는 파일에 남는다",
      insert_whose_client_left_is_still_stored),
+    ("[T221] SIGINT 때 실행 중이던 SELECT는 전체 응답을, 대기열의 INSERT는 200을 받고, 서버는 "
+     "종료 코드 0으로 끝나며, 같은 데이터 폴더로 다시 뜬 서버에 그 INSERT가 남아 있다",
+     interrupted_server_finishes_received_requests_and_restarts),
+    ("[T222] SIGINT 뒤의 새 TCP 연결은 거절되고, 열린 keep-alive 연결의 새 요청은 "
+     "503 shutting_down과 Connection: close를 받은 뒤 닫힌다",
+     interrupted_server_refuses_new_connections_and_keep_alive_requests),
+    ("[T223] 응답을 읽지 않는 클라이언트는 마지막 작업이 끝난 뒤 --shutdown-wait만큼만 종료를 늦춘다",
+     unread_reply_delays_shutdown_only_for_the_wait),
+    ("[T224] 두 번째 SIGINT 때 실행 중이던 INSERT는 완전한 record로 남고, 대기열에만 있던 INSERT는 "
+     "남지 않으며, 다음 시작이 성공한다",
+     second_interrupt_keeps_running_insert_and_drops_queued_one),
 ]
 
 

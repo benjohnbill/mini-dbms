@@ -16,11 +16,16 @@
    그래서 연결은 mg_listen으로 받고, Mongoose에서는 헤더 파서
    (mg_http_parse)와 응답 쓰기(mg_http_reply)만 씁니다.
 
+   SIGINT를 받으면 새 연결을 받지 않고, 받은 작업을 끝까지 처리해 응답을 보낸
+   뒤 정해진 순서로 정리하고 끝납니다(server_shutdown). 두 번째 SIGINT는 응답
+   전송 대기를 건너뛰고 대기열에서 아직 시작하지 않은 작업을 버립니다.
+
    종료 코드: 0 정상 종료, 1 시작 실패, 2 잘못된 인자. */
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +46,10 @@
 #define THREAD_COUNT_MAX 1024
 #define QUEUE_CAPACITY_MAX 1000000
 #define IDLE_TIMEOUT_MS_MAX 86400000
+/* SIGINT 뒤 마지막 작업이 끝나고 남은 응답 전송을 기다리는 최대 시간입니다.
+   종료 전체의 시간이 아닙니다. 긴 SCAN이 있으면 종료가 더 걸립니다. */
+#define DEFAULT_SHUTDOWN_WAIT_MS 5000
+#define SHUTDOWN_WAIT_MS_MAX 600000
 #define LISTEN_URL_BYTES 300
 /* 작업 스레드가 mg_wakeup()으로 깨우므로 이 시간은 응답 지연이 아니라, 깨우는
    신호를 놓쳤을 때 완료 대기열을 다시 보기까지의 상한입니다. 쉬는 연결을
@@ -90,6 +99,7 @@ struct server_args {
     long thread_count;
     long queue_capacity;
     long idle_timeout_ms;
+    long shutdown_wait_ms;
 };
 
 /* 요청 하나입니다. 이벤트 루프가 만들어 작업 대기열에 넣고, 작업 스레드가
@@ -116,7 +126,16 @@ struct server {
     struct work_queue *work_queue;
     struct done_queue done;
     uint64_t idle_timeout_ms;
+    uint64_t shutdown_wait_ms;
+    /* 작업 대기열에 넣었지만 아직 응답을 송신 버퍼에 넣지 않은 요청 수입니다.
+       이벤트 루프만 읽고 씁니다. */
+    size_t requests_in_flight;
+    bool is_shutting_down; /* SIGINT를 본 뒤로 참 */
 };
+
+/* 시그널 핸들러는 이 수를 올리기만 합니다. 이벤트 루프가 매 poll 뒤에
+   읽습니다. */
+static volatile sig_atomic_t interrupt_count;
 
 /* 받은 연결 하나의 상태입니다. 이벤트 루프만 읽고 씁니다. 연결의 data 칸에
    이 구조체의 주소를 넣어 두고, 연결이 닫힐 때 해제합니다.
@@ -140,6 +159,14 @@ enum body_length_status {
 static int args_parse(int argc, char *argv[], struct server_args *args);
 static bool number_parse(const char *text, long min, long max, long *number);
 static int server_run(const struct server_args *args);
+static void interrupt_handler_install(void);
+static void interrupt_handle(int signal_number);
+static void shutdown_begin(struct server *server);
+static void requests_discard_queued(struct server *server);
+static void request_discard(void *job);
+static void replies_flush(struct server *server);
+static bool replies_are_pending(const struct mg_mgr *manager);
+static void connections_close(struct mg_mgr *manager);
 static void connection_event_handle(struct mg_connection *connection, int event,
                                     void *event_data);
 static struct client *client_find(const struct mg_connection *connection);
@@ -195,6 +222,7 @@ int main(int argc, char *argv[])
         .thread_count = DEFAULT_THREAD_COUNT,
         .queue_capacity = DEFAULT_QUEUE_CAPACITY,
         .idle_timeout_ms = DEFAULT_IDLE_TIMEOUT_MS,
+        .shutdown_wait_ms = DEFAULT_SHUTDOWN_WAIT_MS,
     };
 
     if (args_parse(argc, argv, &args) != 0) {
@@ -202,6 +230,7 @@ int main(int argc, char *argv[])
                 "usage: %s [--data <dir>] [--host <addr>] [--port <n>]\n"
                 "          [--threads <n>] [--queue <n>] [--idle-timeout "
                 "<ms>]\n"
+                "          [--shutdown-wait <ms>]\n"
                 "  --data     데이터 폴더 (기본 %s)\n"
                 "  --host     묶을 주소 (기본 %s). 시연용입니다. 서버에는 "
                 "인증이 없으므로\n"
@@ -212,10 +241,13 @@ int main(int argc, char *argv[])
                 "  --queue    작업 대기열 칸 수 (기본 %d). 0이면 모든 SQL "
                 "요청을 503으로 거절합니다\n"
                 "  --idle-timeout  주고받은 바이트가 없는 연결을 닫기까지의 "
-                "밀리초 (기본 %d)\n",
+                "밀리초 (기본 %d)\n"
+                "  --shutdown-wait  SIGINT 뒤 마지막 작업이 끝나고 남은 응답 "
+                "전송을 기다리는\n"
+                "             최대 밀리초 (기본 %d)\n",
                 argv[0], DEFAULT_DATA_DIR, DEFAULT_HOST, DEFAULT_PORT,
                 DEFAULT_THREAD_COUNT, DEFAULT_QUEUE_CAPACITY,
-                DEFAULT_IDLE_TIMEOUT_MS);
+                DEFAULT_IDLE_TIMEOUT_MS, DEFAULT_SHUTDOWN_WAIT_MS);
         return EXIT_USAGE;
     }
     return server_run(&args);
@@ -247,6 +279,9 @@ static int args_parse(int argc, char *argv[], struct server_args *args)
         } else if (strcmp(option, "--idle-timeout") == 0) {
             valid = number_parse(value, 1, IDLE_TIMEOUT_MS_MAX,
                                  &args->idle_timeout_ms);
+        } else if (strcmp(option, "--shutdown-wait") == 0) {
+            valid = number_parse(value, 0, SHUTDOWN_WAIT_MS_MAX,
+                                 &args->shutdown_wait_ms);
         } else {
             valid = false;
         }
@@ -274,7 +309,16 @@ static bool number_parse(const char *text, long min, long max, long *number)
 }
 
 /* 엔진, Mongoose 매니저, 작업 스레드 순서로 만들고 이벤트 루프를 돕니다.
-   작업 스레드는 매니저의 깨우기 통로를 쓰므로 매니저 뒤에 만듭니다. */
+   작업 스레드는 매니저의 깨우기 통로를 쓰므로 매니저 뒤에 만듭니다.
+
+   SIGINT를 받으면 듣기 연결을 닫고, 받은 작업이 모두 끝나 응답이 송신
+   버퍼에 들어갈 때까지 이벤트 루프를 계속 돕니다. 응답은 이벤트 루프만 보낼
+   수 있기 때문입니다. 그 뒤 남은 응답 전송을 최대 shutdown_wait_ms 기다리고,
+   연결, 작업 스레드, 매니저, 엔진 순서로 정리합니다. 작업 스레드가
+   mg_wakeup()으로 매니저를 쓰므로, 스레드를 모두 join한 뒤에 매니저를
+   해제합니다. 두 번째 SIGINT는 대기열에서 아직 시작하지 않은 작업을 버리고
+   전송 대기를 건너뜁니다. 실행 중인 작업은 끝까지 기다립니다. 쓰는 중인
+   INSERT를 끊으면 잘린 record가 남아 다음 시작이 실패하기 때문입니다. */
 static int server_run(const struct server_args *args)
 {
     static struct server server;
@@ -312,12 +356,115 @@ static int server_run(const struct server_args *args)
         engine_destroy(server.engine);
         return EXIT_FAILURE;
     }
+    server.shutdown_wait_ms = (uint64_t)args->shutdown_wait_ms;
+    interrupt_handler_install();
     fprintf(stderr, "listening on %s (threads %ld, queue %ld)\n", listen_url,
             args->thread_count, args->queue_capacity);
-    for (;;) {
+    while (!server.is_shutting_down || server.requests_in_flight > 0) {
         mg_mgr_poll(&server.manager, POLL_INTERVAL_MS);
         done_replies_send(&server);
+        if (interrupt_count > 0 && !server.is_shutting_down) {
+            shutdown_begin(&server);
+        }
+        if (interrupt_count > 1) {
+            requests_discard_queued(&server);
+            break;
+        }
     }
+    replies_flush(&server);
+    connections_close(&server.manager);
+    work_queue_destroy(server.work_queue);
+    /* join 전에 끝난 작업의 결과입니다. 연결이 모두 닫혔으므로 해제만 합니다. */
+    done_replies_send(&server);
+    mg_mgr_free(&server.manager);
+    engine_destroy(server.engine);
+    pthread_mutex_destroy(&server.done.mutex);
+    fprintf(stderr, "stopped\n");
+
+    return EXIT_SUCCESS;
+}
+
+/* signal()은 시스템마다 핸들러를 다시 설치할지가 달라 sigaction을 씁니다. */
+static void interrupt_handler_install(void)
+{
+    struct sigaction action;
+
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = interrupt_handle;
+    sigemptyset(&action.sa_mask);
+    sigaction(SIGINT, &action, NULL);
+}
+
+/* async-signal-safe한 일만 합니다. 이벤트 루프의 poll은 시그널에 깨어나거나
+   POLL_INTERVAL_MS 안에 돌아와 이 수를 봅니다. */
+static void interrupt_handle(int signal_number)
+{
+    (void)signal_number;
+    if (interrupt_count < 2) {
+        interrupt_count++;
+    }
+}
+
+/* 듣기 연결을 닫기로 표시합니다. 다음 poll이 닫고, 닫힌 뒤에
+   connection_event_handle이 stderr에 알립니다. */
+static void shutdown_begin(struct server *server)
+{
+    server->is_shutting_down = true;
+    for (struct mg_connection *connection = server->manager.conns;
+         connection != NULL; connection = connection->next) {
+        if (connection->is_listening) {
+            connection->is_closing = 1;
+        }
+    }
+}
+
+/* 아직 시작하지 않은 작업은 파일을 건드리지 않았으므로 버려도 안전합니다. */
+static void requests_discard_queued(struct server *server)
+{
+    server->requests_in_flight -=
+        work_queue_discard(server->work_queue, request_discard);
+}
+
+static void request_discard(void *job)
+{
+    request_destroy(job);
+}
+
+/* 클라이언트가 응답을 읽지 않아도 종료가 shutdown_wait_ms보다 더 늦지 않게
+   합니다. 두 번째 SIGINT를 받으면 기다리지 않습니다. */
+static void replies_flush(struct server *server)
+{
+    uint64_t deadline_ms = mg_millis() + server->shutdown_wait_ms;
+
+    while (interrupt_count < 2 && replies_are_pending(&server->manager) &&
+           mg_millis() < deadline_ms) {
+        mg_mgr_poll(&server->manager, POLL_INTERVAL_MS);
+    }
+}
+
+static bool replies_are_pending(const struct mg_mgr *manager)
+{
+    for (const struct mg_connection *connection = manager->conns;
+         connection != NULL; connection = connection->next) {
+        if (connection->send.len > 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* 듣기 연결과 받은 연결을 닫기로 표시하고, poll 한 번으로 닫습니다. 깨우기
+   통로의 연결(client가 없음)은 남겨 둡니다. join 전의 작업 스레드가
+   mg_wakeup()으로 그 통로에 쓰기 때문입니다. 매니저 해제가 마지막에 닫습니다. */
+static void connections_close(struct mg_mgr *manager)
+{
+    for (struct mg_connection *connection = manager->conns; connection != NULL;
+         connection = connection->next) {
+        if (connection->is_listening || client_find(connection) != NULL) {
+            connection->is_closing = 1;
+        }
+    }
+    mg_mgr_poll(manager, 0);
 }
 
 /* 이벤트 루프에서만 불립니다. 듣는 연결의 이벤트는 넘기고, 받은 연결마다
@@ -331,6 +478,9 @@ static void connection_event_handle(struct mg_connection *connection, int event,
     struct client *client = client_find(connection);
 
     if (connection->is_listening) {
+        if (event == MG_EV_CLOSE && server->is_shutting_down) {
+            fprintf(stderr, "stopped accepting connections\n");
+        }
         return;
     }
     if (event == MG_EV_ACCEPT) {
@@ -464,7 +614,13 @@ static size_t request_take(struct server *server,
         header_has_token(&message, "Connection", "close") ||
         (mg_strcasecmp(message.proto, mg_str("HTTP/1.0")) == 0 &&
          !client->announces_keep_alive);
-    request_route(server, connection, client, &message, length_status);
+    if (server->is_shutting_down) {
+        client->closes_after_reply = true;
+        error_reply(connection, HTTP_UNAVAILABLE, "", "shutting_down",
+                    "서버가 종료하는 중입니다");
+    } else {
+        request_route(server, connection, client, &message, length_status);
+    }
 
     return (size_t)head_len + body_len;
 }
@@ -597,6 +753,7 @@ static void request_submit(struct server *server,
                     "작업 대기열이 가득 찼습니다");
         return;
     }
+    server->requests_in_flight++;
     client->awaits_reply = true;
     connection->is_full = 1;
 }
@@ -708,6 +865,7 @@ static void done_replies_send(struct server *server)
         struct mg_connection *connection =
             connection_find(&server->manager, request->connection_id);
 
+        server->requests_in_flight--;
         if (connection != NULL) {
             client_find(connection)->awaits_reply = false;
             connection->is_full = 0;
