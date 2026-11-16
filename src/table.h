@@ -19,7 +19,7 @@ struct table {
     struct schema_field *fields;
     int fd;
     uint64_t committed_size;
-    int64_t next_id;
+    int64_t last_id; /* 가장 큰 ID, 빈 테이블이면 0. 다음 ID는 이 값 + 1 */
 };
 
 /* values는 스키마 순서의 field 값이고, text는 다음 next 호출 전까지만 쓸 수

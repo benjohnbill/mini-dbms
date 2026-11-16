@@ -14,6 +14,23 @@
 static char data_dir[DATA_DIR_MAX];
 
 static void write_file(const char *name, const char *content);
+static long file_size_get(const char *name);
+static long file_size_get(const char *name)
+{
+    char path[PATH_MAX_LEN];
+    FILE *file;
+    long size;
+
+    snprintf(path, sizeof(path), "%s/%s", data_dir, name);
+    file = fopen(path, "rb");
+    TEST_ASSERT(file != NULL);
+    fseek(file, 0, SEEK_END);
+    size = ftell(file);
+    fclose(file);
+
+    return size;
+}
+
 static void data_dir_create(void);
 static void data_dir_remove(void);
 static struct engine *users_engine_create(void);
@@ -289,6 +306,45 @@ static void missing_table_file_stops_engine_create_test(void)
     data_dir_remove();
 }
 
+static void insert_after_max_id_fails_and_keeps_file_test(void)
+{
+    /* age INT 테이블의 record 하나: 본문 길이 16, id = INT64_MAX - 1,
+       age = 7. 모든 정수는 리틀 엔디언입니다. */
+    const unsigned char record_bytes[] = {
+        0x10, 0x00, 0x00, 0x00, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0x7f, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    char path[PATH_MAX_LEN];
+    struct engine *engine;
+    struct engine_result *result;
+    FILE *file;
+
+    data_dir_create();
+    write_file("ages.schema", "age INT\n");
+    snprintf(path, sizeof(path), "%s/ages.tbl", data_dir);
+    file = fopen(path, "wb");
+    TEST_ASSERT(file != NULL);
+    fwrite(record_bytes, 1, sizeof(record_bytes), file);
+    fclose(file);
+    engine = engine_reopen();
+
+    result = execute_one(engine, "INSERT INTO ages VALUES (8);");
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_CHECK(result->inserted_id == INT64_MAX);
+    engine_result_destroy(result);
+    TEST_CHECK(file_size_get("ages.tbl") == 40);
+
+    result = execute_one(engine, "INSERT INTO ages VALUES (9);");
+    TEST_CHECK(result->status == ENGINE_ERROR);
+    TEST_CHECK(strstr(result->error_message, "id") != NULL);
+    TEST_MSG("error: %s", result->error_message);
+    engine_result_destroy(result);
+    TEST_CHECK(file_size_get("ages.tbl") == 40);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
 TEST_LIST = {
     {"[T6] INSERT는 ID 1을 받고 SELECT *가 그 record를 돌려준다",
      insert_returns_id_and_select_returns_record_test},
@@ -314,6 +370,9 @@ TEST_LIST = {
     {"[T22] 테이블 파일이 없는 테이블이 있으면 엔진 만들기가 실패하고 파일을 "
      "만들지 않는다",
      missing_table_file_stops_engine_create_test},
+    {"다음 ID가 INT 최댓값을 넘으면 INSERT는 오류이고 테이블 파일이 "
+     "바뀌지 않는다",
+     insert_after_max_id_fails_and_keeps_file_test},
     {NULL, NULL},
 };
 

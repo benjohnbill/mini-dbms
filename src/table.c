@@ -65,7 +65,6 @@ struct table *table_create(const char *data_dir, const char *name, char *error,
         return NULL;
     }
     table->fd = -1;
-    table->next_id = 1;
     table->name = strdup(name);
     snprintf(path, sizeof(path), "%s/%s.schema", data_dir, name);
     if (table->name == NULL ||
@@ -111,13 +110,21 @@ int table_insert(struct table *table, const struct value *values,
                  int64_t *inserted_id, char *error, size_t error_size)
 {
     size_t size = record_size(table, values);
-    unsigned char *bytes = malloc(size);
+    unsigned char *bytes;
+    int64_t new_id;
 
+    if (table->last_id == INT64_MAX) {
+        error_set(error, error_size, "%s: id reached the INT maximum",
+                  table->name);
+        return -1;
+    }
+    new_id = table->last_id + 1;
+    bytes = malloc(size);
     if (bytes == NULL) {
         error_set(error, error_size, "out of memory");
         return -1;
     }
-    record_encode(table, table->next_id, values, bytes);
+    record_encode(table, new_id, values, bytes);
     if (write_full(table->fd, bytes, size, table->committed_size) != 0) {
         error_set(error, error_size, "%s.tbl: %s", table->name,
                   strerror(errno));
@@ -127,7 +134,8 @@ int table_insert(struct table *table, const struct value *values,
     free(bytes);
     /* 쓰기가 모두 끝난 뒤에만 파일 끝 위치와 ID를 올립니다. */
     table->committed_size += size;
-    *inserted_id = table->next_id++;
+    table->last_id = new_id;
+    *inserted_id = new_id;
 
     return 0;
 }
@@ -264,7 +272,7 @@ static bool schema_has_field(const struct table *table, const char *name)
     return false;
 }
 
-/* 테이블 파일을 처음부터 끝까지 한 번 읽어 다음 ID를 정합니다. 깨진 파일
+/* 테이블 파일을 처음부터 끝까지 한 번 읽어 가장 큰 ID를 찾습니다. 깨진 파일
    판정(티켓 04)도 이 읽기에 더합니다. */
 static int table_records_load(struct table *table, char *error,
                               size_t error_size)
@@ -289,7 +297,7 @@ static int table_records_load(struct table *table, char *error,
                   table->name);
         return -1;
     }
-    table->next_id = max_id + 1;
+    table->last_id = max_id;
 
     return 0;
 }
