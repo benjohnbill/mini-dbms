@@ -2,21 +2,30 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 #include "sql.h"
 #include "table.h"
 
 #define SCHEMA_SUFFIX ".schema"
+#define LOCK_FILE_NAME ".lock"
+#define LOCK_PATH_BYTES 1024
 
+/* lock_fd는 잠금 파일을 연 fd이고, 닫으면 잠금이 풀립니다. */
 struct engine {
+    int lock_fd;
     struct table **tables;
     size_t table_count;
 };
 
+static int engine_lock_data_dir(struct engine *engine, const char *data_dir,
+                                char *error, size_t error_size);
 static int engine_load_tables(struct engine *engine, const char *data_dir,
                               char *error, size_t error_size);
 static int engine_add_table(struct engine *engine, struct table *table);
@@ -44,7 +53,11 @@ struct engine *engine_create(const char *data_dir,
         snprintf(error, error_size, "out of memory");
         return NULL;
     }
-    if (engine_load_tables(engine, data_dir, error, error_size) != 0) {
+    engine->lock_fd = -1;
+    /* 다른 프로세스가 같은 파일을 쓰는 중에 읽지 않도록, 스키마와 테이블
+       파일을 읽기 전에 잠급니다. */
+    if (engine_lock_data_dir(engine, data_dir, error, error_size) != 0 ||
+        engine_load_tables(engine, data_dir, error, error_size) != 0) {
         engine_destroy(engine);
         return NULL;
     }
@@ -117,7 +130,36 @@ void engine_destroy(struct engine *engine)
         table_destroy(engine->tables[i]);
     }
     free(engine->tables);
+    if (engine->lock_fd >= 0) {
+        close(engine->lock_fd);
+    }
     free(engine);
+}
+
+/* 데이터 폴더의 잠금 파일에 비차단 배타 flock을 겁니다. flock은 열린 파일마다
+   잠그므로 같은 프로세스의 두 번째 엔진도 실패하고, 프로세스가 끝나면 커널이
+   잠금을 풉니다. */
+static int engine_lock_data_dir(struct engine *engine, const char *data_dir,
+                                char *error, size_t error_size)
+{
+    char path[LOCK_PATH_BYTES];
+
+    snprintf(path, sizeof(path), "%s/%s", data_dir, LOCK_FILE_NAME);
+    engine->lock_fd = open(path, O_RDWR | O_CREAT, 0644);
+    if (engine->lock_fd < 0) {
+        snprintf(error, error_size, "%s: %s", path, strerror(errno));
+        return -1;
+    }
+    if (flock(engine->lock_fd, LOCK_EX | LOCK_NB) != 0) {
+        if (errno == EWOULDBLOCK) {
+            snprintf(error, error_size,
+                     "%s: data folder is in use by another process", data_dir);
+        } else {
+            snprintf(error, error_size, "%s: %s", path, strerror(errno));
+        }
+        return -1;
+    }
+    return 0;
 }
 
 /* 데이터 폴더의 <테이블>.schema마다 테이블 하나를 엽니다. */

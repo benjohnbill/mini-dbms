@@ -1,3 +1,4 @@
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,19 @@ static void write_file(const char *name, const char *content);
 static void data_dir_create(void);
 static void data_dir_remove(void);
 static struct engine *users_engine_create(void);
+static struct engine *engine_reopen(void);
+/* 같은 데이터 폴더로 엔진을 다시 만듭니다. CLI를 다시 실행한 것과
+   같습니다. */
+static struct engine *engine_reopen(void)
+{
+    char error[ENGINE_ERROR_MAX] = "";
+    struct engine *engine = engine_create(data_dir, NULL, error, sizeof(error));
+
+    TEST_ASSERT(engine != NULL);
+    TEST_MSG("error: %s", error);
+    return engine;
+}
+
 static struct engine_result *execute_one(struct engine *engine,
                                          const char *sql);
 static void check_text(const struct value *value, const char *expected);
@@ -155,6 +169,126 @@ static void broken_statement_returns_error_test(void)
     data_dir_remove();
 }
 
+static void restart_keeps_records_and_continues_ids_test(void)
+{
+    struct engine *engine = users_engine_create();
+    struct engine_result *result;
+
+    for (int i = 0; i < 3; i++) {
+        result = execute_one(engine, "INSERT INTO users VALUES ('a', 'b', 1);");
+        TEST_CHECK(result->status == ENGINE_OK);
+        engine_result_destroy(result);
+    }
+    engine_destroy(engine);
+
+    engine = engine_reopen();
+    result = execute_one(engine, "SELECT * FROM users;");
+    TEST_CHECK(result->record_count == 3);
+    engine_result_destroy(result);
+    result = execute_one(engine, "INSERT INTO users VALUES ('c', 'd', 2);");
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_CHECK(result->inserted_id == 4);
+    engine_result_destroy(result);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
+static void each_table_counts_ids_from_one_test(void)
+{
+    const char *inserts[] = {
+        "INSERT INTO users VALUES ('a', 'b', 1);",
+        "INSERT INTO items VALUES ('pen');",
+        "INSERT INTO users VALUES ('c', 'd', 2);",
+        "INSERT INTO items VALUES ('cup');",
+    };
+    const int64_t expected_ids[] = {1, 1, 2, 2};
+    struct engine *engine;
+
+    data_dir_create();
+    write_file("users.schema", "name TEXT\nemail TEXT\nage INT\n");
+    write_file("users.tbl", "");
+    write_file("items.schema", "title TEXT\n");
+    write_file("items.tbl", "");
+    engine = engine_reopen();
+    for (size_t i = 0; i < sizeof(inserts) / sizeof(inserts[0]); i++) {
+        struct engine_result *result = execute_one(engine, inserts[i]);
+
+        TEST_CHECK(result->status == ENGINE_OK);
+        TEST_CHECK(result->inserted_id == expected_ids[i]);
+        TEST_MSG("sql: %s, id: %lld", inserts[i],
+                 (long long)result->inserted_id);
+        engine_result_destroy(result);
+    }
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
+static void second_engine_on_locked_folder_fails_test(void)
+{
+    struct engine *first = users_engine_create();
+    char error[ENGINE_ERROR_MAX] = "";
+    struct engine *second = engine_create(data_dir, NULL, error, sizeof(error));
+
+    TEST_CHECK(second == NULL);
+    TEST_CHECK(strstr(error, "in use") != NULL);
+    TEST_MSG("error: %s", error);
+    engine_destroy(second);
+    engine_destroy(first);
+
+    second = engine_reopen();
+    engine_destroy(second);
+    data_dir_remove();
+}
+
+static void bad_schema_stops_engine_create_test(void)
+{
+    struct {
+        const char *schema;
+        const char *expected_error;
+    } cases[] = {
+        {"name TEXT\nbroken\n", "line 2"},
+        {"name TEXT\nage INT extra\n", "line 2"},
+        {"name TEXT\nname INT\n", "name"},
+        {"name VARCHAR\n", "VARCHAR"},
+        {"id INT\nname TEXT\n", "id"},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char error[ENGINE_ERROR_MAX] = "";
+        struct engine *engine;
+
+        data_dir_create();
+        write_file("users.schema", cases[i].schema);
+        write_file("users.tbl", "");
+        engine = engine_create(data_dir, NULL, error, sizeof(error));
+        TEST_CHECK(engine == NULL);
+        TEST_CHECK(strstr(error, cases[i].expected_error) != NULL);
+        TEST_MSG("schema: %s, error: %s", cases[i].schema, error);
+        engine_destroy(engine);
+        data_dir_remove();
+    }
+}
+
+static void missing_table_file_stops_engine_create_test(void)
+{
+    char error[ENGINE_ERROR_MAX] = "";
+    char path[PATH_MAX_LEN];
+    struct engine *engine;
+
+    data_dir_create();
+    write_file("users.schema", "name TEXT\n");
+    engine = engine_create(data_dir, NULL, error, sizeof(error));
+    TEST_CHECK(engine == NULL);
+    TEST_CHECK(strstr(error, "users.tbl") != NULL);
+    TEST_MSG("error: %s", error);
+    snprintf(path, sizeof(path), "%s/users.tbl", data_dir);
+    TEST_CHECK(access(path, F_OK) != 0);
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
 TEST_LIST = {
     {"[T6] INSERT는 ID 1을 받고 SELECT *가 그 record를 돌려준다",
      insert_returns_id_and_select_returns_record_test},
@@ -167,6 +301,19 @@ TEST_LIST = {
      next_sql_points_after_semicolon_test},
     {"문법, 값 개수, 타입, 테이블이 틀린 문장은 오류를 돌려준다",
      broken_statement_returns_error_test},
+    {"엔진을 다시 만들어도 record가 남고 ID는 가장 큰 ID 다음부터 이어진다",
+     restart_keeps_records_and_continues_ids_test},
+    {"[T20] 두 테이블에 번갈아 INSERT하면 테이블마다 ID가 1부터 따로 오른다",
+     each_table_counts_ids_from_one_test},
+    {"잠긴 데이터 폴더로 만든 두 번째 엔진은 실패하고, 첫 엔진을 해제하면 "
+     "만들어진다",
+     second_engine_on_locked_folder_fails_test},
+    {"[T21] 형식이 틀린 줄, 같은 field 이름, 지원하지 않는 타입, 스키마의 "
+     "id는 엔진 만들기를 멈추고, 형식 오류는 줄 번호를 알린다",
+     bad_schema_stops_engine_create_test},
+    {"[T22] 테이블 파일이 없는 테이블이 있으면 엔진 만들기가 실패하고 파일을 "
+     "만들지 않는다",
+     missing_table_file_stops_engine_create_test},
     {NULL, NULL},
 };
 
@@ -188,14 +335,24 @@ static void data_dir_create(void)
     TEST_ASSERT(mkdtemp(data_dir) != NULL);
 }
 
+/* 데이터 폴더 안의 파일(스키마, 테이블, 잠금 파일)을 모두 지우고 폴더를
+   지웁니다. */
 static void data_dir_remove(void)
 {
+    DIR *dir = opendir(data_dir);
+    struct dirent *entry;
     char path[PATH_MAX_LEN];
 
-    snprintf(path, sizeof(path), "%s/users.schema", data_dir);
-    unlink(path);
-    snprintf(path, sizeof(path), "%s/users.tbl", data_dir);
-    unlink(path);
+    TEST_ASSERT(dir != NULL);
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        snprintf(path, sizeof(path), "%s/%s", data_dir, entry->d_name);
+        unlink(path);
+    }
+    closedir(dir);
     rmdir(data_dir);
 }
 

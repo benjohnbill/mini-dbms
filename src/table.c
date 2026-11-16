@@ -31,8 +31,12 @@ struct table_scan {
 static void error_set(char *error, size_t error_size, const char *format, ...);
 static int schema_load(struct table *table, const char *path, char *error,
                        size_t error_size);
-static int schema_add_field(struct table *table, const char *line, char *error,
-                            size_t error_size);
+static int schema_add_field(struct table *table, const char *line,
+                            int line_number, char *error, size_t error_size);
+static int schema_type_parse(const char *type_name, enum value_type *type);
+static bool schema_has_field(const struct table *table, const char *name);
+static int table_records_load(struct table *table, char *error,
+                              size_t error_size);
 static size_t record_size(const struct table *table,
                           const struct value *values);
 static void record_encode(const struct table *table, int64_t record_id,
@@ -79,6 +83,10 @@ struct table *table_create(const char *data_dir, const char *name, char *error,
         return NULL;
     }
     table->committed_size = (uint64_t)file_stat.st_size;
+    if (table_records_load(table, error, error_size) != 0) {
+        table_destroy(table);
+        return NULL;
+    }
 
     return table;
 }
@@ -159,6 +167,7 @@ static int schema_load(struct table *table, const char *path, char *error,
     FILE *file = fopen(path, "r");
     char *line = NULL;
     size_t line_capacity = 0;
+    int line_number = 0;
     int status = 0;
 
     if (file == NULL) {
@@ -166,7 +175,8 @@ static int schema_load(struct table *table, const char *path, char *error,
         return -1;
     }
     while (status == 0 && getline(&line, &line_capacity, file) != -1) {
-        status = schema_add_field(table, line, error, error_size);
+        line_number++;
+        status = schema_add_field(table, line, line_number, error, error_size);
     }
     free(line);
     fclose(file);
@@ -178,12 +188,15 @@ static int schema_load(struct table *table, const char *path, char *error,
     return status;
 }
 
-static int schema_add_field(struct table *table, const char *line, char *error,
-                            size_t error_size)
+/* 한 줄은 `이름 타입` 두 낱말입니다. id는 엔진이 붙이므로 스키마에 적을 수
+   없습니다. */
+static int schema_add_field(struct table *table, const char *line,
+                            int line_number, char *error, size_t error_size)
 {
     char name[PATH_BYTES];
     char type_name[16];
-    int matched = sscanf(line, "%1023s %15s", name, type_name);
+    char extra[2];
+    int matched = sscanf(line, "%1023s %15s %1s", name, type_name, extra);
     struct schema_field *fields;
     enum value_type type;
 
@@ -191,17 +204,24 @@ static int schema_add_field(struct table *table, const char *line, char *error,
         return 0;
     }
     if (matched != 2) {
-        error_set(error, error_size, "%s.schema: bad line: %s", table->name,
-                  line);
+        error_set(error, error_size, "%s.schema: line %d: expected `name TYPE`",
+                  table->name, line_number);
         return -1;
     }
-    if (strcmp(type_name, "INT") == 0) {
-        type = VALUE_INT;
-    } else if (strcmp(type_name, "TEXT") == 0) {
-        type = VALUE_TEXT;
-    } else {
-        error_set(error, error_size, "%s.schema: unknown type %s", table->name,
-                  type_name);
+    if (schema_type_parse(type_name, &type) != 0) {
+        error_set(error, error_size, "%s.schema: line %d: unsupported type %s",
+                  table->name, line_number, type_name);
+        return -1;
+    }
+    if (strcmp(name, "id") == 0) {
+        error_set(error, error_size,
+                  "%s.schema: line %d: id is added by the engine", table->name,
+                  line_number);
+        return -1;
+    }
+    if (schema_has_field(table, name)) {
+        error_set(error, error_size, "%s.schema: line %d: duplicate field %s",
+                  table->name, line_number, name);
         return -1;
     }
     fields = realloc(table->fields,
@@ -218,6 +238,58 @@ static int schema_add_field(struct table *table, const char *line, char *error,
         return -1;
     }
     table->field_count++;
+
+    return 0;
+}
+
+static int schema_type_parse(const char *type_name, enum value_type *type)
+{
+    if (strcmp(type_name, "INT") == 0) {
+        *type = VALUE_INT;
+    } else if (strcmp(type_name, "TEXT") == 0) {
+        *type = VALUE_TEXT;
+    } else {
+        return -1;
+    }
+    return 0;
+}
+
+static bool schema_has_field(const struct table *table, const char *name)
+{
+    for (size_t i = 0; i < table->field_count; i++) {
+        if (strcmp(table->fields[i].name, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* 테이블 파일을 처음부터 끝까지 한 번 읽어 다음 ID를 정합니다. 깨진 파일
+   판정(티켓 04)도 이 읽기에 더합니다. */
+static int table_records_load(struct table *table, char *error,
+                              size_t error_size)
+{
+    struct record_iterator *iterator = table_scan_create(table);
+    struct record record;
+    int64_t max_id = 0;
+    int status;
+
+    if (iterator == NULL) {
+        error_set(error, error_size, "out of memory");
+        return -1;
+    }
+    while ((status = iterator->next(iterator, &record)) == 1) {
+        if (record.id > max_id) {
+            max_id = record.id;
+        }
+    }
+    iterator->destroy(iterator);
+    if (status != 0) {
+        error_set(error, error_size, "%s.tbl: cannot read records",
+                  table->name);
+        return -1;
+    }
+    table->next_id = max_id + 1;
 
     return 0;
 }
