@@ -139,7 +139,12 @@ SQL 한 문장이 처리기, 인덱스, 데이터 파일을 지나는 흐름과,
 
 ## 성능 비교
 
-Phase 2의 ID 기준 SELECT(인덱스 사용)와 다른 필드 기준 SELECT(선형 탐색)의 속도 차이를 적습니다. 티켓 08이 결론과 측정 기록 링크를 채웁니다. 측정 기록은 [`docs/measurements/`](docs/measurements/)에 측정 한 번마다 파일 하나로 남깁니다.
+`make bench`가 100만 record를 생성해 CLI로 넣고, 같은 record를 ID 기준 SELECT(INDEX)와 다른 필드 기준 SELECT(SCAN)로 찾아 잽니다.
+
+- **INDEX 대 SCAN:** INDEX는 중앙값 0.8\~1.6 µs, p99 2.5 µs 이하이고, SCAN은 중앙값 567\~857 ms입니다. INDEX는 record 1개를, SCAN은 1,000,000개를 읽습니다. 같은 ID를 강제로 SCAN해도 같은 범위라, 차이는 접근 경로에서 나옵니다. 모든 쌍에서 두 경로의 결과가 같은 record였습니다.
+- **노드 크기:** 16, 32, 64, 128 중 메모리가 가장 적고 삽입이 가장 빠른 128로 정했습니다.
+
+측정 기록: [`docs/measurements/001-CJG-index-vs-scan.md`](docs/measurements/001-CJG-index-vs-scan.md). 측정 기록은 [`docs/measurements/`](docs/measurements/)에 측정 한 번마다 파일 하나로 남깁니다.
 
 ## 알려진 한계
 
