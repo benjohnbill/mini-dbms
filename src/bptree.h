@@ -8,10 +8,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* 노드 하나가 담는 키의 최대 수입니다. 측정(make bench)이 16, 32, 64,
-   128을 견주려고 빌드 때 -DBPTREE_NODE_KEYS=N으로 바꿉니다. */
+/* 노드 하나가 담는 키의 최대 수입니다. 128은 100만 키에서 16, 32, 64보다
+   찾기와 삽입이 빠르고 메모리가 적었습니다
+   (docs/measurements/001-CJG-index-vs-scan.md). 측정(make bench)은 빌드 때
+   -DBPTREE_NODE_KEYS=N으로 바꿔 견줍니다. */
 #ifndef BPTREE_NODE_KEYS
-#define BPTREE_NODE_KEYS 32
+#define BPTREE_NODE_KEYS 128
 #endif
 
 struct bptree;
