@@ -345,6 +345,90 @@ static void insert_after_max_id_fails_and_keeps_file_test(void)
     data_dir_remove();
 }
 
+/* 테이블 파일 바이트를 만듭니다. 모든 정수는 리틀 엔디언입니다. */
+static size_t put_le(unsigned char *bytes, uint64_t number, size_t width)
+{
+    for (size_t i = 0; i < width; i++) {
+        bytes[i] = (unsigned char)(number >> (8 * i));
+    }
+    return width;
+}
+
+/* name TEXT 스키마의 record 하나를 bytes에 쓰고 쓴 바이트 수를 돌려줍니다.
+   body_len과 text_len은 일부러 내용과 다르게 줄 수 있습니다. */
+static size_t text_record_put(unsigned char *bytes, uint32_t body_len,
+                              int64_t new_id, uint32_t text_len,
+                              const char *text)
+{
+    size_t size = put_le(bytes, body_len, 4);
+
+    size += put_le(bytes + size, (uint64_t)new_id, 8);
+    size += put_le(bytes + size, text_len, 4);
+    memcpy(bytes + size, text, strlen(text));
+    return size + strlen(text);
+}
+
+static void table_file_write(const char *name, const unsigned char *bytes,
+                             size_t size)
+{
+    char path[PATH_MAX_LEN];
+    FILE *file;
+
+    snprintf(path, sizeof(path), "%s/%s", data_dir, name);
+    file = fopen(path, "wb");
+    TEST_ASSERT(file != NULL);
+    TEST_ASSERT(fwrite(bytes, 1, size, file) == size);
+    fclose(file);
+}
+
+/* users(name TEXT) 테이블 파일을 bytes로 두고 엔진을 만들면 실패하고,
+   메시지에 파일 이름, 바이트 위치, record 번호, 종류가 있고, 파일이 그대로인지
+   확인합니다. */
+static void broken_table_check(const unsigned char *bytes, size_t size,
+                               const char *position, const char *record_no,
+                               const char *kind)
+{
+    char error[ENGINE_ERROR_MAX] = "";
+    char path[PATH_MAX_LEN];
+    unsigned char after[256];
+    struct engine *engine;
+    FILE *file;
+    size_t after_size;
+
+    TEST_ASSERT(size <= sizeof(after));
+    data_dir_create();
+    write_file("users.schema", "name TEXT\n");
+    table_file_write("users.tbl", bytes, size);
+    engine = engine_create(data_dir, NULL, error, sizeof(error));
+    TEST_CHECK(engine == NULL);
+    TEST_CHECK(strstr(error, "users.tbl") != NULL);
+    TEST_CHECK(strstr(error, position) != NULL);
+    TEST_CHECK(strstr(error, record_no) != NULL);
+    TEST_CHECK(strstr(error, kind) != NULL);
+    TEST_MSG("expected %s, %s, %s; error: %s", position, record_no, kind,
+             error);
+    engine_destroy(engine);
+    snprintf(path, sizeof(path), "%s/users.tbl", data_dir);
+    file = fopen(path, "rb");
+    TEST_ASSERT(file != NULL);
+    after_size = fread(after, 1, sizeof(after), file);
+    fclose(file);
+    TEST_CHECK(after_size == size && memcmp(after, bytes, size) == 0);
+    data_dir_remove();
+}
+
+static void length_cut_in_last_record_is_truncation_test(void)
+{
+    unsigned char bytes[64];
+    size_t size = text_record_put(bytes, 15, 1, 3, "abc");
+
+    for (size_t cut = 1; cut <= 3; cut++) {
+        put_le(bytes + size, 15, 4);
+        broken_table_check(bytes, size + cut, "19번째 바이트", "record(2번째)",
+                           "잘림");
+    }
+}
+
 TEST_LIST = {
     {"[T6] INSERT는 ID 1을 받고 SELECT *가 그 record를 돌려준다",
      insert_returns_id_and_select_returns_record_test},
@@ -373,6 +457,9 @@ TEST_LIST = {
     {"다음 ID가 INT 최댓값을 넘으면 INSERT는 오류이고 테이블 파일이 "
      "바뀌지 않는다",
      insert_after_max_id_fails_and_keeps_file_test},
+    {"[T60] 마지막 길이 칸 중간(1~3바이트)에서 끝난 테이블 파일은 잘림으로 "
+     "엔진 만들기를 멈추고 파일을 고치지 않는다",
+     length_cut_in_last_record_is_truncation_test},
     {NULL, NULL},
 };
 
