@@ -920,7 +920,7 @@ static void select_reports_scan_and_records_examined_test(void)
         execute_one(engine, "INSERT INTO users VALUES ('kim', 'k@x', 20);"));
     engine_result_destroy(
         execute_one(engine, "INSERT INTO users VALUES ('lee', 'l@x', 31);"));
-    result = execute_one(engine, "SELECT * FROM users WHERE id = 2;");
+    result = execute_one(engine, "SELECT * FROM users WHERE name = 'lee';");
     TEST_CHECK(result->status == ENGINE_OK);
     TEST_CHECK(result->access_path == ENGINE_ACCESS_PATH_SCAN);
     TEST_CHECK(result->record_count == 1);
@@ -929,6 +929,103 @@ static void select_reports_scan_and_records_examined_test(void)
 
     result = execute_one(engine, "SELECT * FROM users WHERE age = 'x';");
     TEST_CHECK(result->status == ENGINE_ERROR);
+    TEST_CHECK(result->records_examined == 0);
+    engine_result_destroy(result);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
+/* users에 ('user1', 'u1@x', 1)부터 ('userN', 'uN@x', N)까지 N개를 넣습니다.
+   ID는 1부터 N입니다. */
+static void users_insert(struct engine *engine, int count)
+{
+    char sql[128];
+
+    for (int i = 1; i <= count; i++) {
+        struct engine_result *result;
+
+        snprintf(sql, sizeof(sql),
+                 "INSERT INTO users VALUES ('user%d', 'u%d@x', %d);", i, i, i);
+        result = execute_one(engine, sql);
+        TEST_CHECK(result->status == ENGINE_OK);
+        engine_result_destroy(result);
+    }
+}
+
+/* SELECT *의 결과가 INDEX로 찾은 record 하나이고, 값이 users_insert가 넣은
+   expected_name, expected_email, expected_age인지 확인하고 해제합니다. */
+static void check_index_record(struct engine_result *result,
+                               int64_t expected_id, const char *expected_name,
+                               const char *expected_email, int64_t expected_age)
+{
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_CHECK(result->access_path == ENGINE_ACCESS_PATH_INDEX);
+    TEST_CHECK(result->records_examined == 1);
+    TEST_ASSERT(result->record_count == 1);
+    TEST_CHECK(result->values[0].integer == expected_id);
+    check_text(&result->values[1], expected_name);
+    check_text(&result->values[2], expected_email);
+    TEST_CHECK(result->values[3].integer == expected_age);
+    engine_result_destroy(result);
+}
+
+static void where_id_reads_one_record_through_index_test(void)
+{
+    struct engine *engine = users_engine_create();
+
+    users_insert(engine, 10);
+    check_index_record(execute_one(engine, "SELECT * FROM users WHERE id = 7;"),
+                       7, "user7", "u7@x", 7);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
+static void where_missing_id_reads_no_record_test(void)
+{
+    struct engine *engine = users_engine_create();
+    struct engine_result *result;
+
+    users_insert(engine, 10);
+    result = execute_one(engine, "SELECT * FROM users WHERE id = 11;");
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_CHECK(result->access_path == ENGINE_ACCESS_PATH_INDEX);
+    TEST_CHECK(result->record_count == 0);
+    TEST_CHECK(result->records_examined == 0);
+    engine_result_destroy(result);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
+static void where_other_field_scans_all_records_test(void)
+{
+    struct engine *engine = users_engine_create();
+    struct engine_result *result;
+
+    users_insert(engine, 10);
+    result = execute_one(engine, "SELECT * FROM users WHERE email = 'u7@x';");
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_CHECK(result->access_path == ENGINE_ACCESS_PATH_SCAN);
+    TEST_CHECK(result->record_count == 1);
+    TEST_CHECK(result->records_examined == 10);
+    engine_result_destroy(result);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
+static void where_id_with_text_is_type_error_without_reading_test(void)
+{
+    struct engine *engine = users_engine_create();
+    struct engine_result *result;
+
+    users_insert(engine, 3);
+    result = execute_one(engine, "SELECT * FROM users WHERE id = 'abc';");
+    TEST_CHECK(result->status == ENGINE_ERROR);
+    TEST_CHECK(result->error_reason == ENGINE_REASON_TYPE);
+    TEST_CHECK(result->record_count == 0);
     TEST_CHECK(result->records_examined == 0);
     engine_result_destroy(result);
 
@@ -1020,6 +1117,15 @@ TEST_LIST = {
     {"SELECT는 접근 경로 SCAN과 읽은 레코드 수를 돌려주고 타입 오류는 레코드를 "
      "읽지 않는다",
      select_reports_scan_and_records_examined_test},
+    {"[T100] WHERE id = 7은 INDEX로 그 record 하나만 읽는다",
+     where_id_reads_one_record_through_index_test},
+    {"[T101] ID가 1~N인 테이블에서 WHERE id = N+1은 INDEX이고 0건이며 "
+     "record를 읽지 않는다",
+     where_missing_id_reads_no_record_test},
+    {"[T102] id가 아닌 field의 WHERE는 SCAN이고 모든 record를 읽는다",
+     where_other_field_scans_all_records_test},
+    {"[T103] WHERE id = 'abc'는 타입 오류이고 record를 읽지 않는다",
+     where_id_with_text_is_type_error_without_reading_test},
     {NULL, NULL},
 };
 

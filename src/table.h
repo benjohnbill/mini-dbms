@@ -10,6 +10,8 @@
 
 #include "value.h"
 
+struct bptree;
+
 struct schema_field {
     char *name;
     enum value_type type;
@@ -23,6 +25,8 @@ struct table {
     uint64_t committed_size;
     int64_t last_id; /* 가장 큰 ID, 빈 테이블이면 0. 다음 ID는 이 값 + 1 */
     bool available;  /* 되돌리기가 실패하면 거짓. 재시작해야 다시 참 */
+    /* id → 그 record의 offset. 시작할 때 테이블 파일에서 다시 만듭니다 */
+    struct bptree *tree;
 };
 
 /* INSERT가 파일을 쓰고 자를 때, 그리고 파일을 쓰기 전에 record 버퍼를
@@ -74,5 +78,10 @@ enum table_insert_status table_insert(struct table *table,
 
 /* committed_size까지 처음부터 읽는 SCAN iterator입니다. */
 struct record_iterator *table_scan_create(struct table *table);
+
+/* B+ 트리에서 target_id의 offset을 찾아 그 record 하나만 읽는 INDEX
+   iterator입니다. target_id가 없으면 record를 읽지 않고 바로 끝납니다. */
+struct record_iterator *table_index_create(struct table *table,
+                                           int64_t target_id);
 
 #endif

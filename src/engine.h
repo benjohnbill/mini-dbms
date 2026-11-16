@@ -46,10 +46,11 @@ enum engine_statement_kind {
     ENGINE_STATEMENT_SELECT,
 };
 
-/* SELECT가 record를 찾은 방법입니다. 지금은 SCAN뿐이고 티켓 07이 INDEX를
-   더합니다. */
+/* SELECT가 record를 찾은 방법입니다. 조건이 id = 정수이면 INDEX, 그 밖은
+   SCAN입니다. */
 enum engine_access_path {
     ENGINE_ACCESS_PATH_SCAN,
+    ENGINE_ACCESS_PATH_INDEX,
 };
 
 /* 실행 결과 하나입니다. 받은 쪽이 engine_result_destroy()로 해제합니다.
