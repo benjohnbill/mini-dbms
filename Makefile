@@ -65,8 +65,9 @@ TSAN_BUILD  := $(BUILD)/tsan
 TSAN_CFLAGS := -std=c11 -Wall -Wextra -Werror -g -O1 -fno-omit-frame-pointer \
                -fsanitize=thread -pthread -MMD -MP
 TSAN_LIB_OBJS := $(LIB_SRCS:src/%.c=$(TSAN_BUILD)/%.o)
-# 잠금 단위 테스트와, 여러 스레드가 엔진을 함께 부르는 엔진 테스트입니다.
-TSAN_TESTS  := $(TSAN_BUILD)/rwlock_test $(TSAN_BUILD)/engine_test
+# 잠금과 작업 대기열의 단위 테스트와, 여러 스레드가 엔진을 함께 부르는 엔진 테스트입니다.
+TSAN_TESTS  := $(TSAN_BUILD)/rwlock_test $(TSAN_BUILD)/engine_test \
+               $(TSAN_BUILD)/work_queue_test
 TSAN_ENGINE_TESTS := T123 T124 T125
 
 # Acutest는 테스트마다 자식 프로세스를 만들고 그 종료 코드를 결과로 읽습니다. TSan의
@@ -76,6 +77,7 @@ TSAN_RUN := TSAN_OPTIONS=exitcode=1
 tsan: $(TSAN_TESTS)
 	$(TSAN_RUN) ./$(TSAN_BUILD)/rwlock_test
 	$(TSAN_RUN) ./$(TSAN_BUILD)/engine_test $(TSAN_ENGINE_TESTS)
+	$(TSAN_RUN) ./$(TSAN_BUILD)/work_queue_test
 
 $(TSAN_BUILD)/%.o: src/%.c | $(TSAN_BUILD)
 	$(CC) $(CPPFLAGS) $(TSAN_CFLAGS) -c $< -o $@
