@@ -179,7 +179,19 @@ HTTP/1.1 연결은 다시 씁니다. 한 연결에 요청을 여러 개 이어 �
 
 본문 길이는 `Content-Length` 하나로 보냅니다. chunked(`Transfer-Encoding`)는 받지 않습니다. 헤더(요청 줄 포함)는 8 KiB, 본문은 1 MiB까지 받습니다. 둘의 합은 Mongoose의 연결당 수신 버퍼 한도(`MG_MAX_RECV_SIZE`, 3 MiB)보다 작습니다. 그 한도에 먼저 걸리면 Mongoose가 응답 없이 연결을 닫기 때문입니다. 서버는 헤더를 다 받은 때 길이 표기와 상한을 먼저 확인하므로 1 MiB를 넘는 본문은 받기 전에 거절합니다. 선언한 길이만큼 본문을 받기 전에 끊긴 요청은 실행하지 않습니다.
 
-결과 상한은 record 1만 건, 값의 누적 16 MiB(`INT`는 8바이트, `TEXT`는 바이트 길이), JSON 응답 32 MiB입니다. 엔진은 상한을 넘으면 모으기를 멈추고 모은 record를 해제하며, 서버는 JSON을 만들면서 응답 바이트를 확인합니다. 넘으면 `400 result_too_large`입니다. CLI에는 결과 상한이 없습니다.
+결과 상한은 record 1만 건, 값의 누적 16 MiB(`INT`는 8바이트, `TEXT`는 바이트 길이), JSON 응답 32 MiB입니다. 결과가 상한에 닿으면 서버는 거기까지의 record와 `next_cursor`를 돌려줍니다. 엔진은 record 수와 값의 바이트로 멈추고, 서버는 record마다 JSON 길이를 재어 32 MiB 앞에서 한 번 더 자릅니다. record 하나가 값 16 MiB나 JSON 32 MiB를 넘으면 나눌 수 없으므로 `400 result_too_large`입니다. CLI에는 결과 상한이 없고 나눠 받지 않습니다.
+
+#### 큰 결과 나눠 받기
+
+`next_cursor`는 아직 받지 않은 다음 record가 테이블 파일에서 시작하는 바이트 위치입니다. 다음 부분은 같은 SQL을 `POST /query?cursor=<next_cursor>`로 다시 보내 받습니다. 마지막 부분에는 `next_cursor`가 없습니다. 정확히 1만 건인 결과도 한 부분이고 `next_cursor`가 없습니다.
+
+```bash
+curl -s --data-binary 'SELECT * FROM users;' http://127.0.0.1:8080/query
+# {"fields": [...], "records": [...1만 건...], ..., "next_cursor": 620000}
+curl -s --data-binary 'SELECT * FROM users;' 'http://127.0.0.1:8080/query?cursor=620000'
+```
+
+서버는 커서 위치에서 SCAN을 시작하고, 테이블의 읽기 잠금은 한 부분을 읽는 동안만 쥡니다. 그래서 부분 사이의 INSERT는 기다리지 않습니다. 테이블 파일은 덧붙이기만 하므로 부분 사이에 들어간 record는 조건에 맞으면 뒤 부분에만 나오고, 앞서 받은 record가 다시 나오거나 빠지지 않습니다. 커서는 record가 시작하는 위치이거나 파일 끝이어야 합니다. 서버는 그 위치의 record를 읽고, 그 `id`를 B+ 트리에서 찾아 같은 위치가 나오는지 봅니다. 질의 문자열은 `cursor=<0 이상의 정수>` 하나만 받습니다. `WHERE id = 정수`(INDEX 경로)와 INSERT에는 커서를 붙이지 않습니다. 부분 크기 1만은 측정으로 정했습니다([`docs/measurements/002-CJG-cursor-part-size.md`](docs/measurements/002-CJG-cursor-part-size.md)).
 
 ### 응답
 
@@ -187,7 +199,7 @@ HTTP/1.1 연결은 다시 씁니다. 한 연결에 요청을 여러 개 이어 �
 
 | 결과 | 상태 | 본문 |
 |---|---|---|
-| SELECT 성공 | `200` | `{"fields": [...], "records": [[...], ...], "access_path": "INDEX", "records_examined": 1}`. 결과가 0건이면 `records`는 `[]`입니다 |
+| SELECT 성공 | `200` | `{"fields": [...], "records": [[...], ...], "access_path": "INDEX", "records_examined": 1}`. 결과가 0건이면 `records`는 `[]`입니다. 결과 상한에 닿아 나뉜 부분에는 `"next_cursor": <정수>`가 붙습니다 |
 | INSERT 성공 | `200` | `{"inserted": 1, "id": 3}` |
 | 오류 | 아래 표 | `{"error": "<오류 이유>", "message": "<사람이 읽는 설명>"}` |
 
@@ -199,7 +211,8 @@ HTTP/1.1 연결은 다시 씁니다. 한 연결에 요청을 여러 개 이어 �
 | `400` | `multiple_statements` | 본문에 문장이 둘 이상 |
 | `400` | `no_statement` | 빈 본문, 또는 공백만 있는 본문 |
 | `400` | `invalid_sql_body` | 본문에 NUL 바이트(`0x00`)가 있음 |
-| `400` | `result_too_large` | 결과가 record 1만 건, 값 16 MiB, 또는 JSON 32 MiB를 넘음 |
+| `400` | `result_too_large` | record 하나가 값 16 MiB 또는 JSON 32 MiB를 넘음 |
+| `400` | `invalid_cursor` | 커서가 record 시작이나 파일 끝이 아님, 파일 크기보다 큼, 0 이상의 정수가 아님, 질의 문자열이 `cursor=` 하나가 아님, 또는 INDEX 경로의 SELECT나 INSERT에 커서가 붙음 |
 | `400` | `invalid_body_length` | `Content-Length`가 숫자가 아니거나 여러 번 옴, 또는 `Transfer-Encoding`과 함께 옴. 연결을 닫습니다 |
 | `400` | `invalid_request` | 요청 줄이나 헤더를 HTTP로 읽을 수 없음. 연결을 닫습니다 |
 | `404` | `route_not_found` | `/query`가 아닌 경로 |
@@ -234,6 +247,7 @@ SQL 한 문장이 처리기, 인덱스, 데이터 파일을 지나는 흐름과,
 - 길이 칸은 맞고 `TEXT` 바이트만 바뀐 손상은 찾지 못합니다. 체크섬(CRC)이 없기 때문입니다([`docs/prd/issues/04-detect-damaged-table-file.md`](docs/prd/issues/04-detect-damaged-table-file.md)).
 - 깨진 테이블 파일은 사람이 고쳐야 다시 시작합니다. 엔진은 `잘림`이나 `손상`을 찾으면 파일 이름, 바이트 위치, record 번호를 알리고 멈출 뿐, 파일을 고치지 않습니다.
 - JSON 정수는 JavaScript 안전 정수 범위 `±(2^53 − 1)`를 넘으면 클라이언트에서 정밀도를 잃습니다. 서버는 64비트 정수를 그대로 JSON 숫자로 보내지만, JavaScript의 `JSON.parse`는 숫자를 double로 읽기 때문입니다(`docs/prd/final.md` § Phase 3, 응답).
+- 커서로 나눠 받은 결과는 한 시점의 스냅샷이 아닙니다. 부분 사이의 INSERT는 뒤 부분에 나옵니다. 이 성질은 테이블 파일이 덧붙이기만 한다는 데 기대므로, UPDATE나 DELETE를 범위에 넣으면 커서 설계를 다시 검토합니다([`docs/prd/issues/13-cursor-paging-for-large-results.md`](docs/prd/issues/13-cursor-paging-for-large-results.md)).
 
 ## 파일 트리
 
