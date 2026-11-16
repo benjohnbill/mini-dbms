@@ -156,7 +156,7 @@ static void broken_statement_returns_error_test(void)
 }
 
 TEST_LIST = {
-    {"INSERT는 ID 1을 받고 SELECT *가 그 record를 돌려준다",
+    {"[T6] INSERT는 ID 1을 받고 SELECT *가 그 record를 돌려준다",
      insert_returns_id_and_select_returns_record_test},
     {"INSERT의 ID는 1부터 1씩 오른다", insert_ids_increase_from_one_test},
     {"빈 테이블의 SELECT *는 field 이름만 돌려준다",

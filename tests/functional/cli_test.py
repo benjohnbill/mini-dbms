@@ -139,17 +139,17 @@ def sql_error_exits_1():
 
 
 TESTS = [
-    ("빈 데이터 폴더에서 INSERT 두 개와 SELECT *는 ID 1, 2인 record를 TSV로 출력한다",
+    ("[T1] 빈 데이터 폴더에서 INSERT 두 개와 SELECT *는 ID 1, 2인 record를 TSV로 출력한다",
      insert_two_and_select_prints_ids_1_and_2),
-    ("INSERT 두 개 뒤 테이블 파일의 바이트가 레이아웃과 같다",
+    ("[T2] INSERT 두 개 뒤 테이블 파일의 바이트가 레이아웃과 같다",
      insert_two_leaves_table_file_bytes_in_layout),
-    ("TEXT 안의 탭, 줄바꿈, 역슬래시는 \\t, \\n, \\\\로 출력된다",
+    ("[T3] TEXT 안의 탭, 줄바꿈, 역슬래시는 \\t, \\n, \\\\로 출력된다",
      tab_newline_backslash_in_text_are_escaped),
     ("빈 테이블의 SELECT *는 field 이름 줄만 출력한다",
      select_on_empty_table_prints_field_names_only),
     ("--data를 생략하면 data/ 폴더를 쓴다", data_option_defaults_to_data_folder),
-    ("잘못된 CLI 인자는 종료 코드 2로 끝난다", bad_cli_arguments_exit_2),
-    ("열 수 없는 SQL 파일은 종료 코드 1로 끝난다", unreadable_sql_file_exits_1),
+    ("[T4] 잘못된 CLI 인자는 종료 코드 2로 끝난다", bad_cli_arguments_exit_2),
+    ("[T5] 열 수 없는 SQL 파일은 종료 코드 1로 끝난다", unreadable_sql_file_exits_1),
     ("SQL 실행 오류는 종료 코드 1로 끝난다", sql_error_exits_1),
 ]
 

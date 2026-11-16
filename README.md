@@ -27,7 +27,7 @@ LMS는 과제를 세 단계로 나눕니다. 마일스톤은 따로 두지 않�
 
 | Phase | 만드는 것 | 확인할 것 | 요구사항 | 상태 |
 |---|---|---|---|---|
-| 1 | **SQL 처리기.** 텍스트 파일에 적은 SQL을 CLI로 넘기면 파싱하고 실행합니다. `INSERT`는 테이블 파일에 데이터를 더하고, `SELECT`는 테이블 파일에서 데이터를 읽어 출력합니다. | SQL이 올바르게 파싱되고 실행되는지 | L7\~L19, L35\~L38, L47 | 진행 전 |
+| 1 | **SQL 처리기.** 텍스트 파일에 적은 SQL을 CLI로 넘기면 파싱하고 실행합니다. `INSERT`는 테이블 파일에 데이터를 더하고, `SELECT`는 테이블 파일에서 데이터를 읽어 출력합니다. | SQL이 올바르게 파싱되고 실행되는지 | L7\~L19, L35\~L38, L47 | 진행 중 |
 | 2 | **B+ 트리 인덱스.** 레코드가 추가될 때마다 ID를 자동으로 부여하고, 그 ID를 B+ 트리에 등록합니다. ID로 찾는 `SELECT`는 B+ 트리를 사용합니다. | 레코드 100만 건 이상에서 ID 조회(인덱스 사용)와 다른 필드 조회(처음부터 끝까지 탐색)의 속도 차이 | L20\~L26, L39\~L41, L48 | 진행 전 |
 | 3 | **API 서버.** 외부 클라이언트가 HTTP로 SQL을 보내면, 스레드 풀이 요청을 나눠 받아 병렬로 처리합니다. | 여러 요청이 동시에 들어와도 결과가 맞는지 | L27\~L30, L42\~L44, L49 | 진행 전 |
 
@@ -61,17 +61,34 @@ cd mini-dbms
 make verify
 ```
 
-현재 CLI는 SQL 파일 경로를 인자 하나로 받는 단계입니다. 파일을 읽거나 SQL을 실행하는 기능은 티켓 01부터 더합니다. 경로를 생략하면 사용법을 출력하고 종료 코드 2로 끝납니다.
+`make`로 CLI(`build/mini-dbms`)를 빌드합니다. CLI는 데이터 폴더와 SQL 파일을 받습니다.
+
+```text
+mini-dbms [--data 폴더] <SQL 파일>
+```
+
+데이터 폴더에는 테이블마다 스키마 파일과 빈 테이블 파일을 미리 만들어 둡니다. 엔진은 두 파일을 만들지 않습니다. 스키마 파일은 한 줄에 field 하나(`이름 INT` 또는 `이름 TEXT`)를 적고, `id`는 적지 않습니다. 테이블 이름은 파일 이름입니다. `--data`를 생략하면 `data/`를 씁니다. 우리 `INT`는 64비트입니다(PostgreSQL과 MySQL의 `INT`는 32비트).
 
 ```bash
+make
+mkdir -p data
+printf 'name TEXT\nemail TEXT\nage INT\n' > data/users.schema
+: > data/users.tbl
+cat > example.sql <<'SQL'
+INSERT INTO users VALUES ('kim', 'kim@example.com', 20);
+SELECT * FROM users;
+SQL
 ./build/mini-dbms example.sql
 ```
 
-최종 PRD가 정한 CLI는 아래 모양입니다. `--data`는 데이터 폴더(스키마 파일과 데이터 파일이 있는 곳), `-q`는 INSERT 결과 출력을 끕니다. SELECT 결과는 stdout에 TSV로, 접근 경로와 읽은 레코드 수는 stderr에 한 줄로 씁니다. 종료 코드는 0(성공), 1(파일·SQL·실행 오류), 2(잘못된 인자)입니다. 바이너리 데이터 파일을 사람이 읽는 줄로 보는 `dump` 명령은 티켓 03이 더하고, 사용법을 이 절에 적습니다.
+CLI는 SQL 파일의 문장을 위에서부터 하나씩 실행하고 첫 오류에서 멈춥니다. SELECT 결과는 stdout에 TSV로 씁니다. 첫 줄은 field 이름이고 첫 field는 `id`입니다. `TEXT` 안의 탭, 줄바꿈, 역슬래시는 `\t`, `\n`, `\\`로 적습니다. 종료 코드는 0(성공), 1(파일·SQL·실행 오류), 2(잘못된 인자)입니다.
 
 ```text
-mini-dbms [--data 폴더] [-q] <SQL 파일>
+id	name	email	age
+1	kim	kim@example.com	20
 ```
+
+최종 PRD가 정한 CLI에는 INSERT 결과 출력을 끄는 `-q`, stderr의 메타 줄(티켓 02), 바이너리 데이터 파일을 사람이 읽는 줄로 보는 `dump` 명령(티켓 03)이 더해집니다.
 
 필요한 검사만 따로 실행할 수도 있습니다.
 
@@ -118,13 +135,19 @@ Phase 2의 ID 기준 SELECT(인덱스 사용)와 다른 필드 기준 SELECT(선
 
 티켓마다 그 티켓이 만드는 한계를 한 줄씩 더합니다(티켓 01, 02, 04, 10, 12, 13). 전체 목록은 `docs/prd/final.md` § Further Notes에 있고, 일부러 하지 않는 기능은 같은 문서의 Out of Scope에 있습니다.
 
+- `fsync`를 하지 않아 정전 때 성공을 알린 record를 잃을 수 있습니다(`docs/prd/final.md` § 공통, 영속성).
+
 ## 파일 트리
 
 ```
 mini-dbms/
 ├─ Makefile          make verify, make test, make functional, make lint
 ├─ src/
-│  └─ cli.c          CLI 진입점. SQL 파일 경로를 받습니다
+│  ├─ cli.c          CLI 진입점. SQL 파일을 문장 하나씩 엔진에 넘기고 TSV로 출력합니다
+│  ├─ engine.[ch]    DB 엔진의 공개 함수 네 개(만들기, 문장 하나 실행, 결과 해제, 엔진 해제)
+│  ├─ sql.[ch]       토크나이저와 재귀 하강 파서
+│  ├─ table.[ch]     스키마 파일, 바이너리 테이블 파일, SCAN iterator
+│  └─ value.h        field 값 하나(INT, TEXT)
 ├─ tests/            단위 테스트(*_test.c), 기능 테스트(functional/)
 ├─ scripts/
 │  ├─ check-ids.py   테스트 ID와 ADR 이름 검사
