@@ -6,6 +6,8 @@
 
 import fcntl
 import os
+import resource
+import signal
 import shutil
 import subprocess
 import sys
@@ -201,6 +203,32 @@ def dump_of_unknown_table_exits_1():
         shutil.rmtree(data_dir)
 
 
+def failed_write_exits_1_and_keeps_table_file():
+    data_dir = make_data_dir()
+    table_path = os.path.join(data_dir, "users.tbl")
+    try:
+        assert run_sql(data_dir, "INSERT INTO users VALUES ('kim', 'k@x', 20);\n").returncode == 0
+        with open(table_path, "rb") as f:
+            before = f.read()
+
+        def limit_file_size():
+            # 테이블 파일의 지금 크기를 상한으로 두면 다음 쓰기가 EFBIG로 실패합니다.
+            signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+            resource.setrlimit(resource.RLIMIT_FSIZE, (len(before), resource.RLIM_INFINITY))
+
+        sql_path = os.path.join(data_dir, "input.sql")
+        with open(sql_path, "w", encoding="utf-8") as f:
+            f.write("INSERT INTO users VALUES ('lee', 'l@x', 31);\n")
+        proc = subprocess.run([CLI, "--data", data_dir, sql_path],
+                              capture_output=True, preexec_fn=limit_file_size)
+        assert proc.returncode == 1, proc.returncode
+        assert b"users.tbl" in proc.stderr, proc.stderr
+        with open(table_path, "rb") as f:
+            assert f.read() == before
+    finally:
+        shutil.rmtree(data_dir)
+
+
 TESTS = [
     ("[T1] 빈 데이터 폴더에서 INSERT 두 개와 SELECT *는 ID 1, 2인 record를 TSV로 출력한다",
      insert_two_and_select_prints_ids_1_and_2),
@@ -214,6 +242,8 @@ TESTS = [
     ("[T4] 잘못된 CLI 인자는 종료 코드 2로 끝난다", bad_cli_arguments_exit_2),
     ("[T5] 열 수 없는 SQL 파일은 종료 코드 1로 끝난다", unreadable_sql_file_exits_1),
     ("SQL 실행 오류는 종료 코드 1로 끝난다", sql_error_exits_1),
+    ("[T87] 테이블 파일 쓰기가 실패하면 CLI는 stderr에 오류를 쓰고 종료 코드 1로 끝나며 테이블 파일은 그대로다",
+     failed_write_exits_1_and_keeps_table_file),
     ("INSERT 세 개 뒤 CLI를 다시 실행하면 세 record가 조회되고 다음 INSERT는 ID 4를 받는다",
      rerun_keeps_records_and_next_id_is_4),
     ("다른 프로세스가 데이터 폴더를 잠근 동안 CLI는 종료 코드 1로 끝나고, 잠금이 풀리면 실행된다",
