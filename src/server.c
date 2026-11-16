@@ -59,7 +59,10 @@ _Static_assert(HEADER_BYTES_MAX + BODY_BYTES_MAX < MG_MAX_RECV_SIZE,
 /* 결과 상한입니다. 엔진은 record 수와 값의 누적 바이트로 멈추고, 서버는 JSON
    응답 바이트로 한 번 더 확인합니다. 이스케이프로 JSON이 값보다 커질 수
    있기 때문입니다. */
+/* 부분 하나의 record 수입니다. make bench-cursor만 -D로 바꿔 크기를 견줍니다. */
+#ifndef RESULT_RECORDS_MAX
 #define RESULT_RECORDS_MAX 10000
+#endif
 #define RESULT_BYTES_MAX (16 * 1024 * 1024)
 #define RESPONSE_BYTES_MAX (32 * 1024 * 1024)
 /* SELECT JSON의 records 뒤에 붙는 꼬리(access_path, records_examined,

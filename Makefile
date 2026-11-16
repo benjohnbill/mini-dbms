@@ -31,7 +31,8 @@ FUNCTIONAL_TESTS = $(filter-out $(SERVER_FUNCTIONAL_TESTS),$(wildcard tests/func
 
 CLI      := $(BUILD)/mini-dbms
 
-.PHONY: all test functional verify tsan lint format clean bench bench-smoke
+.PHONY: all test functional verify tsan lint format clean bench bench-smoke \
+        bench-cursor
 
 all: $(CLI) $(TEST_BINS)
 
@@ -167,6 +168,20 @@ $(TSAN_SERVER): src/server.c $(TSAN_LIB_OBJS) $(TSAN_BUILD)/mongoose.o | $(TSAN_
 
 $(TSAN_BUILD)/mongoose.o: $(MONGOOSE_DIR)/mongoose.c $(MONGOOSE_DIR)/mongoose.h Makefile | $(TSAN_BUILD)
 	$(CC) $(CPPFLAGS) $(MONGOOSE_FLAGS) $(TSAN_CFLAGS) -c $< -o $@
+
+# make bench-cursor: 부분 하나의 크기(RESULT_RECORDS_MAX)마다 -O2 서버를 따로
+# 만들고, 부분 하나의 응답 시간, 전체를 커서로 받는 시간, 서버의 최대 RSS를 잽니다.
+BENCH_CURSOR_RECORDS ?= 1000000
+BENCH_CURSOR_PARTS   := 1000 10000 100000
+BENCH_CURSOR_BINS    := $(BENCH_CURSOR_PARTS:%=$(BENCH_DIR)/server-%)
+
+$(BENCH_DIR)/server-%: src/server.c $(LIB_SRCS) $(wildcard src/*.h) \
+                       $(MONGOOSE_DIR)/mongoose.c | $(BENCH_DIR)
+	$(CC) $(CPPFLAGS) -I$(MONGOOSE_DIR) -DRESULT_RECORDS_MAX=$* $(BENCH_CFLAGS) \
+	    src/server.c $(LIB_SRCS) $(MONGOOSE_FLAGS) $(MONGOOSE_DIR)/mongoose.c -o $@
+
+bench-cursor: $(BENCH_CURSOR_BINS)
+	python3 -B scripts/bench-cursor.py $(BENCH_DIR) $(BENCH_CURSOR_RECORDS) $(BENCH_CURSOR_PARTS)
 
 # 코드 규칙(CONVENTION.md의 코드 절)입니다. lint는 위반을 출력하고 실패로 끝나며,
 # format은 모양 위반을 고치고 바꾼 줄을 보여 줍니다.
