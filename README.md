@@ -27,8 +27,8 @@ LMS는 과제를 세 단계로 나눕니다. 마일스톤은 따로 두지 않�
 
 | Phase | 만드는 것 | 확인할 것 | 요구사항 | 상태 |
 |---|---|---|---|---|
-| 1 | **SQL 처리기.** 텍스트 파일에 적은 SQL을 CLI로 넘기면 파싱하고 실행합니다. `INSERT`는 테이블 파일에 데이터를 더하고, `SELECT`는 테이블 파일에서 데이터를 읽어 출력합니다. | SQL이 올바르게 파싱되고 실행되는지 | L7\~L19, L35\~L38, L47 | 진행 전 |
-| 2 | **B+ 트리 인덱스.** 레코드가 추가될 때마다 ID를 자동으로 부여하고, 그 ID를 B+ 트리에 등록합니다. ID로 찾는 `SELECT`는 B+ 트리를 사용합니다. | 레코드 100만 건 이상에서 ID 조회(인덱스 사용)와 다른 필드 조회(처음부터 끝까지 탐색)의 속도 차이 | L20\~L26, L39\~L41, L48 | 진행 전 |
+| 1 | **SQL 처리기.** 텍스트 파일에 적은 SQL을 CLI로 넘기면 파싱하고 실행합니다. `INSERT`는 테이블 파일에 데이터를 더하고, `SELECT`는 테이블 파일에서 데이터를 읽어 출력합니다. | SQL이 올바르게 파싱되고 실행되는지 | L7\~L19, L35\~L38, L47 | 진행 중: 티켓 01, 03, 04, 05 완료, 02(SQL 문법 전체와 오류 메시지) 남음 |
+| 2 | **B+ 트리 인덱스.** 레코드가 추가될 때마다 ID를 자동으로 부여하고, 그 ID를 B+ 트리에 등록합니다. ID로 찾는 `SELECT`는 B+ 트리를 사용합니다. | 레코드 100만 건 이상에서 ID 조회(인덱스 사용)와 다른 필드 조회(처음부터 끝까지 탐색)의 속도 차이 | L20\~L26, L39\~L41, L48 | 진행 중: 티켓 06(B+ 트리 모듈) 완료, 엔진에는 아직 연결 안 됨 |
 | 3 | **API 서버.** 외부 클라이언트가 HTTP로 SQL을 보내면, 스레드 풀이 요청을 나눠 받아 병렬로 처리합니다. | 여러 요청이 동시에 들어와도 결과가 맞는지 | L27\~L30, L42\~L44, L49 | 진행 전 |
 
 요구사항 ID는 [`docs/requirements.md`](docs/requirements.md)에 있습니다. L50(엣지 케이스)은 모든 Phase의 테스트에 들어갑니다. 개발 환경(빌드, 테스트 도구, 코드 규칙 검사, CI)은 준비를 마쳤습니다.
@@ -155,8 +155,20 @@ Phase 2의 ID 기준 SELECT(인덱스 사용)와 다른 필드 기준 SELECT(선
 mini-dbms/
 ├─ Makefile          make verify, make test, make functional, make lint
 ├─ src/
-│  └─ cli.c          CLI 진입점. SQL 파일 경로를 받습니다
-├─ tests/            단위 테스트(*_test.c), 기능 테스트(functional/)
+│  ├─ cli.c          CLI 진입점. SQL 파일을 문장 하나씩 엔진에 넘기고 TSV로 출력, dump 명령
+│  ├─ engine.[ch]    엔진 공개 함수 네 개(engine_create, engine_execute,
+│  │                 engine_result_destroy, engine_destroy), 데이터 폴더 잠금
+│  ├─ sql.[ch]       토크나이저와 재귀 하강 파서
+│  ├─ table.[ch]     스키마 파일, 바이너리 테이블 파일, 시작할 때 읽기와 깨진
+│  │                 파일 판정, INSERT 쓰기와 되돌리기, SCAN iterator
+│  ├─ value.h        field 값 하나(INT, TEXT)
+│  └─ bptree.[ch]    B+ 트리 모듈(id → 위치). 아직 엔진에 연결하지 않음
+├─ tests/
+│  ├─ engine_test.c  엔진 함수 네 개로 확인하는 단위 테스트
+│  ├─ bptree_test.c  B+ 트리 단위 테스트
+│  ├─ acutest.h      단위 테스트 도구(가져온 코드)
+│  └─ functional/
+│     └─ cli_test.py CLI 실행 파일 기능 테스트
 ├─ scripts/
 │  ├─ check-ids.py   테스트 ID와 ADR 이름 검사
 │  └─ convention.py  코드 규칙 검사(make lint)와 자동 수정(make format)
