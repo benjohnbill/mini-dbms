@@ -4,7 +4,7 @@
 
 **Blocked by:** 11
 
-**Status:** ready-for-agent
+**Status:** done
 
 ## API
 
@@ -47,3 +47,7 @@
 - [ ] 정확히 1만 건인 결과에는 `next_cursor`가 없고, 10,001건이면 `next_cursor`가 있으며 두 번째 부분은 1건입니다.
 - [ ] 티켓 11의 "1만 1건은 `result_too_large`" 테스트를 이 동작에 맞게 바꿉니다.
 - [ ] `README.md` API 절과 상태 코드 표에 `next_cursor`, `invalid_cursor`를 더합니다.
+
+## Comments
+
+- 2026-11-17: `CJG` 브랜치에 구현하고 병합했습니다(마지막 커밋 `948aae2`). 코드 리뷰 수정은 `04214c5`\~`6b7c2be`입니다. `main`으로 가는 PR에서 닫습니다.

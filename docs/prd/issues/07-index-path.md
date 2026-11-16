@@ -4,7 +4,7 @@
 
 **Blocked by:** 02, 05, 06
 
-**Status:** ready-for-agent
+**Status:** done
 
 작업에 포함되는 것:
 
@@ -24,3 +24,7 @@
 - [ ] CLI를 다시 실행한 뒤에도 `WHERE id = k`가 INDEX로 같은 record를 찾습니다.
 - [ ] 트리 미리 할당이 실패하면 INSERT가 `out_of_memory`이고 파일과 트리가 바뀌지 않습니다.
 - [ ] 같은 조건의 INDEX 결과와 SCAN 결과가 같습니다(측정 전용 강제 SCAN 경로는 티켓 08).
+
+## Comments
+
+- 2026-11-17: `CJG` 브랜치에 구현하고 병합했습니다(마지막 커밋 `0d43175`). 코드 리뷰 수정은 `04214c5`\~`6b7c2be`입니다. `main`으로 가는 PR에서 닫습니다.

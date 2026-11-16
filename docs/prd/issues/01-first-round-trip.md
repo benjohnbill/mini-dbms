@@ -4,7 +4,7 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done
 
 작업에 포함되는 것:
 
@@ -27,3 +27,7 @@
 - [ ] 빈 테이블의 `SELECT *`는 field 이름 줄만 출력합니다.
 - [ ] 잘못된 CLI 인자는 종료 코드 2, 열 수 없는 SQL 파일은 종료 코드 1입니다.
 - [ ] 엔진 단위 테스트가 엔진 함수 네 개만 불러 INSERT와 SELECT 결과를 확인합니다.
+
+## Comments
+
+- 2026-11-17: `CJG` 브랜치에 구현하고 병합했습니다(마지막 커밋 `7681e4f`). 코드 리뷰 수정은 `04214c5`\~`6b7c2be`입니다. `main`으로 가는 PR에서 닫습니다.
