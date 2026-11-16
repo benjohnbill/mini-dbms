@@ -1537,6 +1537,35 @@ static void index_and_scan_return_same_record_test(void)
     data_dir_remove();
 }
 
+/* API 모드(next_sql NULL)는 문장 하나만 받습니다. 둘째 문장이 있으면 첫
+   문장도 실행하지 않습니다. 뒤의 공백은 문장이 아닙니다. */
+static void api_mode_rejects_second_statement_before_running_test(void)
+{
+    struct engine *engine = users_engine_create();
+    struct engine_result *result = engine_execute(
+        engine,
+        "INSERT INTO users VALUES ('a', 'a@x', 1); SELECT * FROM users;", NULL);
+
+    TEST_ASSERT(result != NULL);
+    TEST_CHECK(result->status == ENGINE_ERROR);
+    TEST_CHECK(result->error_reason == ENGINE_REASON_MULTIPLE_STATEMENTS);
+    engine_result_destroy(result);
+
+    result = engine_execute(engine, "SELECT * FROM users; x", NULL);
+    TEST_ASSERT(result != NULL);
+    TEST_CHECK(result->error_reason == ENGINE_REASON_MULTIPLE_STATEMENTS);
+    engine_result_destroy(result);
+
+    result = engine_execute(engine, "SELECT * FROM users; \n\t ", NULL);
+    TEST_ASSERT(result != NULL);
+    TEST_CHECK(result->status == ENGINE_OK);
+    TEST_CHECK(result->record_count == 0);
+    engine_result_destroy(result);
+
+    engine_destroy(engine);
+    data_dir_remove();
+}
+
 TEST_LIST = {
     {"[T6] INSERT는 ID 1을 받고 SELECT *가 그 record를 돌려준다",
      insert_returns_id_and_select_returns_record_test},
@@ -1649,6 +1678,9 @@ TEST_LIST = {
      failed_tree_reserve_keeps_file_and_tree_test},
     {"[T107] 같은 record를 찾는 INDEX 결과와 SCAN 결과가 같다",
      index_and_scan_return_same_record_test},
+    {"[T160] API 모드에서 문장 뒤에 다른 문장이 있으면 multiple_statements "
+     "오류이고 첫 문장도 실행하지 않는다",
+     api_mode_rejects_second_statement_before_running_test},
     {NULL, NULL},
 };
 

@@ -38,6 +38,7 @@ enum engine_error_reason {
     ENGINE_REASON_OUT_OF_MEMORY,
     ENGINE_REASON_STORAGE_ERROR, /* 테이블 파일 읽기와 쓰기 */
     ENGINE_REASON_TABLE_UNAVAILABLE,
+    ENGINE_REASON_MULTIPLE_STATEMENTS, /* API 모드에서 문장 뒤에 다른 글자 */
 };
 
 enum engine_statement_kind {
@@ -80,7 +81,9 @@ struct engine *engine_create(const char *data_dir,
                              size_t error_size);
 
 /* sql 맨 앞의 문장 하나만 실행합니다. next_sql이 NULL이 아니면 다음 문장이
-   시작하는 곳을 *next_sql에 씁니다(CLI 모드). 결과 구조체를 만들 메모리가
+   시작하는 곳을 *next_sql에 씁니다(CLI 모드). next_sql이 NULL이면 API
+   모드이고, 문장 뒤에 공백 말고 다른 글자가 있으면 실행하지 않고
+   ENGINE_REASON_MULTIPLE_STATEMENTS로 끝냅니다. 결과 구조체를 만들 메모리가
    없을 때만 NULL을 돌려줍니다. */
 struct engine_result *engine_execute(struct engine *engine, const char *sql,
                                      const char **next_sql);

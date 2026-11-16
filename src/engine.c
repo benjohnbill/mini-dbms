@@ -1,5 +1,6 @@
 #include "engine.h"
 
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -44,6 +45,7 @@ static void result_fail(struct engine_result *result,
                         enum engine_error_reason code, const char *format, ...);
 static void result_set_sql_error(struct engine_result *result,
                                  const struct sql_error *sql_error);
+static bool sql_rest_is_blank(const char *sql);
 static bool engine_find_table(const struct engine *engine, const char *name,
                               size_t *table_index);
 static void execute_insert(struct table *table,
@@ -117,6 +119,14 @@ struct engine_result *engine_execute(struct engine *engine, const char *sql,
     }
     if (sql_status == SQL_ERROR) {
         result_set_sql_error(result, &sql_error);
+        return result;
+    }
+    /* API 모드는 요청 하나에 문장 하나입니다. 일부만 실행하지 않도록 첫
+       문장도 실행하기 전에 거절합니다. */
+    if (next_sql == NULL && !sql_rest_is_blank(statement_end)) {
+        result_fail(result, ENGINE_REASON_MULTIPLE_STATEMENTS,
+                    "요청 하나에는 SQL 문장 하나만 보냅니다");
+        sql_statement_destroy(statement);
         return result;
     }
     /* 검증 오류는 문장의 첫 토큰을 가리킵니다. 성공하면 쓰지 않습니다. */
@@ -332,6 +342,15 @@ static void result_set_sql_error(struct engine_result *result,
     result_fail(result, codes[sql_error->code], "%s", sql_error->message);
     result->error_line = sql_error->line;
     result->error_byte_in_line = sql_error->byte_in_line;
+}
+
+/* 파서가 문장 사이에서 건너뛰는 공백과 같은 isspace로 봅니다. */
+static bool sql_rest_is_blank(const char *sql)
+{
+    while (isspace((unsigned char)*sql)) {
+        sql++;
+    }
+    return *sql == '\0';
 }
 
 static bool engine_find_table(const struct engine *engine, const char *name,
