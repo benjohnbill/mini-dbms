@@ -8,8 +8,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* 노드 하나가 담는 키의 최대 수입니다. 티켓 08이 측정으로 다시 고릅니다. */
+/* 노드 하나가 담는 키의 최대 수입니다. 측정(make bench)이 16, 32, 64,
+   128을 견주려고 빌드 때 -DBPTREE_NODE_KEYS=N으로 바꿉니다. */
+#ifndef BPTREE_NODE_KEYS
 #define BPTREE_NODE_KEYS 32
+#endif
 
 struct bptree;
 
@@ -28,6 +31,16 @@ void bptree_insert(struct bptree *tree, int64_t key, uint64_t value);
 
 /* key가 있으면 값을 *value에 쓰고 true입니다. */
 bool bptree_find(const struct bptree *tree, int64_t key, uint64_t *value);
+
+/* 측정용 크기입니다. node_bytes는 트리에 달린 노드의 바이트이고, 미리
+   할당해 둔 노드와 트리 구조체 자신은 넣지 않습니다. */
+struct bptree_stats {
+    size_t height; /* 루트에서 리프까지의 노드 수 */
+    size_t node_count;
+    size_t node_bytes;
+};
+
+void bptree_get_stats(const struct bptree *tree, struct bptree_stats *stats);
 
 /* 테스트 전용입니다. 모든 리프의 깊이가 같고, 리프 연결을 따라 키가
    오름차순이며, 키 수가 expected_key_count와 같으면 true입니다. */
