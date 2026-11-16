@@ -131,7 +131,64 @@ PR을 올리거나 고칠 때마다 GitHub Actions가 `make verify`를 실행합
 
 ## API
 
-Phase 3에서 외부 클라이언트가 DBMS를 부르는 방법입니다. 최종 PRD가 정한 모양은 `POST /query`에 SQL 문장 하나를 본문으로 보내고 JSON을 받는 HTTP/1.1 API입니다(`docs/prd/final.md` § Phase 3). 요청, 응답, 상태 코드 표는 티켓 10이 구현과 함께 이 절에 쓰고, 티켓 11\~13이 더합니다.
+Phase 3에서 외부 클라이언트가 DBMS를 부르는 방법입니다. `POST /query`에 SQL 문장 하나를 본문으로 보내고 JSON을 받는 HTTP/1.1 API입니다(`docs/prd/final.md` § Phase 3). 본문 길이, 빈 본문, keep-alive, 결과 상한, 종료는 티켓 11\~13이 이 절에 더합니다.
+
+### 서버 실행
+
+`make`가 CLI와 함께 API 서버(`build/mini-dbms-server`)를 빌드합니다. 서버는 CLI와 같은 데이터 폴더를 씁니다. 엔진이 데이터 폴더를 잠그므로 서버가 도는 동안 같은 폴더로 CLI를 실행할 수 없습니다.
+
+```text
+mini-dbms-server [--data 폴더] [--host 주소] [--port 포트] [--threads 수] [--queue 수]
+```
+
+| 인자 | 기본값 | 뜻 |
+|---|---|---|
+| `--data` | `data` | 데이터 폴더 |
+| `--host` | `127.0.0.1` | 연결을 받을 주소. 시연용입니다. 서버에는 인증이 없으므로, 다른 주소를 열면 그 주소에 닿는 누구나 SQL을 실행합니다 |
+| `--port` | `8080` | 포트 |
+| `--threads` | `8` | 작업 스레드 수 |
+| `--queue` | `128` | 작업 대기열 칸 수 |
+
+`make functional`은 이 서버를 띄워 실제 HTTP 요청을 보내는 기능 테스트도 실행하고, `make tsan`은 ThreadSanitizer로 빌드한 서버로 같은 테스트를 다시 돌립니다. 잘못된 인자는 사용법을 stderr에 쓰고 종료 코드 2로 끝납니다. 엔진을 만들지 못하거나 포트를 열지 못하면 종료 코드 1입니다.
+
+```bash
+./build/mini-dbms-server --port 8080 &
+printf "INSERT INTO users VALUES ('kim', 'kim@example.com', 20);" > q.sql
+curl --data-binary @q.sql http://127.0.0.1:8080/query
+# {"inserted": 1, "id": 1}
+curl --data-binary 'SELECT * FROM users WHERE id = 1;' http://127.0.0.1:8080/query
+# {"fields": ["id", "name", "email", "age"], "records": [[1, "kim", "kim@example.com", 20]], "access_path": "INDEX", "records_examined": 1}
+```
+
+### 요청 처리 흐름
+
+이벤트 루프 스레드 하나가 Mongoose로 연결을 받고, 헤더와 본문을 다 받은 요청의 SQL만 복사해 작업 대기열에 넣습니다. 작업 스레드는 대기열에서 요청을 꺼내 엔진을 API 모드(다음 문장 위치 없이)로 부르고, 만든 JSON을 완료 대기열에 넣은 뒤 `mg_wakeup()`으로 이벤트 루프를 깨우기만 합니다. 응답은 이벤트 루프만 보냅니다. 이벤트 루프는 poll마다 완료 대기열을 비우고, 그 사이 연결이 끊긴 요청의 결과는 해제합니다. 받은 INSERT는 연결이 끊겨도 끝까지 실행합니다.
+
+### 요청
+
+`POST /query`이고 본문은 SQL 문장 하나입니다. 문장 뒤에 다른 문장이 있으면 어느 문장도 실행하지 않고 `400 multiple_statements`로 거절합니다. 문장 뒤의 공백은 괜찮습니다.
+
+### 응답
+
+모든 응답은 `Content-Type: application/json`입니다. `INT`와 `id`는 double을 거치지 않은 JSON 숫자이고, `TEXT`는 JSON 문자열입니다.
+
+| 결과 | 상태 | 본문 |
+|---|---|---|
+| SELECT 성공 | `200` | `{"fields": [...], "records": [[...], ...], "access_path": "INDEX", "records_examined": 1}`. 결과가 0건이면 `records`는 `[]`입니다 |
+| INSERT 성공 | `200` | `{"inserted": 1, "id": 3}` |
+| 오류 | 아래 표 | `{"error": "<오류 이유>", "message": "<사람이 읽는 설명>"}` |
+
+### 상태 코드
+
+| 상태 | 오류 이유 | 언제 |
+|---|---|---|
+| `400` | `syntax_error`, `table_not_found`, `field_not_found`, `type_mismatch`, `value_count_mismatch`, `int_out_of_range`, `text_too_long` | SQL 오류 |
+| `400` | `multiple_statements` | 본문에 문장이 둘 이상 |
+| `400` | `empty_body` | 본문에 공백만 있음 |
+| `404` | `route_not_found` | `/query`가 아닌 경로 |
+| `405` | `method_not_allowed` | `/query`에 POST가 아닌 메서드. `Allow: POST` 헤더를 같이 보냅니다 |
+| `500` | `storage_error`, `table_unavailable`, `out_of_memory` | 테이블 파일 쓰기나 읽기 실패, 되돌리기도 실패해 멈춘 테이블, 메모리 부족 |
+| `503` | `queue_full` | 작업 대기열이 가득 참. 기다리지 않고 바로 답합니다 |
 
 ## 구조
 
@@ -150,6 +207,7 @@ Phase 2의 ID 기준 SELECT(인덱스 사용)와 다른 필드 기준 SELECT(선
 - 우리 `INT`는 64비트이고 PostgreSQL과 MySQL의 `INT`(32비트)와 다릅니다(`docs/prd/final.md` § Phase 1, 타입).
 - 길이 칸은 맞고 `TEXT` 바이트만 바뀐 손상은 찾지 못합니다. 체크섬(CRC)이 없기 때문입니다([`docs/prd/issues/04-detect-damaged-table-file.md`](docs/prd/issues/04-detect-damaged-table-file.md)).
 - 깨진 테이블 파일은 사람이 고쳐야 다시 시작합니다. 엔진은 `잘림`이나 `손상`을 찾으면 파일 이름, 바이트 위치, record 번호를 알리고 멈출 뿐, 파일을 고치지 않습니다.
+- JSON 정수는 JavaScript 안전 정수 범위 `±(2^53 − 1)`를 넘으면 클라이언트에서 정밀도를 잃습니다. 서버는 64비트 정수를 그대로 JSON 숫자로 보내지만, JavaScript의 `JSON.parse`는 숫자를 double로 읽기 때문입니다(`docs/prd/final.md` § Phase 3, 응답).
 
 ## 파일 트리
 
