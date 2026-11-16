@@ -138,7 +138,7 @@ Phase 3에서 외부 클라이언트가 DBMS를 부르는 방법입니다. `POST
 `make`가 CLI와 함께 API 서버(`build/mini-dbms-server`)를 빌드합니다. 서버는 CLI와 같은 데이터 폴더를 씁니다. 엔진이 데이터 폴더를 잠그므로 서버가 도는 동안 같은 폴더로 CLI를 실행할 수 없습니다.
 
 ```text
-mini-dbms-server [--data 폴더] [--host 주소] [--port 포트] [--threads 수] [--queue 수] [--idle-timeout 밀리초]
+mini-dbms-server [--data 폴더] [--host 주소] [--port 포트] [--threads 수] [--queue 수] [--idle-timeout 밀리초] [--shutdown-wait 밀리초]
 ```
 
 | 인자 | 기본값 | 뜻 |
@@ -149,6 +149,7 @@ mini-dbms-server [--data 폴더] [--host 주소] [--port 포트] [--threads 수]
 | `--threads` | `8` | 작업 스레드 수 |
 | `--queue` | `128` | 작업 대기열 칸 수. `0`이면 모든 SQL 요청을 `503 queue_full`로 거절합니다 |
 | `--idle-timeout` | `30000` | 주고받은 바이트가 없는 연결을 서버가 닫기까지의 밀리초. 응답을 기다리는 연결은 닫지 않습니다 |
+| `--shutdown-wait` | `5000` | SIGINT 뒤 마지막 작업이 끝나고 남은 응답 전송을 기다리는 최대 밀리초 |
 
 `make functional`은 이 서버를 띄워 실제 HTTP 요청을 보내는 기능 테스트도 실행하고, `make tsan`은 ThreadSanitizer로 빌드한 서버로 같은 테스트를 다시 돌립니다. 잘못된 인자는 사용법을 stderr에 쓰고 종료 코드 2로 끝납니다. 엔진을 만들지 못하거나 포트를 열지 못하면 종료 코드 1입니다.
 
@@ -210,6 +211,7 @@ HTTP/1.1 연결은 다시 씁니다. 한 연결에 요청을 여러 개 이어 �
 | `500` | `storage_error`, `table_unavailable`, `out_of_memory` | 테이블 파일 쓰기나 읽기 실패, 되돌리기도 실패해 멈춘 테이블, 메모리 부족 |
 | `500` | `id_exhausted` | 테이블의 ID가 `INT` 최댓값(`2^63 − 1`)에 닿아 INSERT가 새 ID를 받을 수 없음 |
 | `503` | `queue_full` | 작업 대기열이 가득 참. 기다리지 않고 바로 답합니다 |
+| `503` | `shutting_down` | SIGINT를 받은 뒤 열린 keep-alive 연결로 온 새 요청. `Connection: close`를 붙이고 연결을 닫습니다 |
 
 ## 구조
 
@@ -234,6 +236,7 @@ SQL 한 문장이 처리기, 인덱스, 데이터 파일을 지나는 흐름과,
 - 길이 칸은 맞고 `TEXT` 바이트만 바뀐 손상은 찾지 못합니다. 체크섬(CRC)이 없기 때문입니다([`docs/prd/issues/04-detect-damaged-table-file.md`](docs/prd/issues/04-detect-damaged-table-file.md)).
 - 깨진 테이블 파일은 사람이 고쳐야 다시 시작합니다. 엔진은 `잘림`이나 `손상`을 찾으면 파일 이름, 바이트 위치, record 번호를 알리고 멈출 뿐, 파일을 고치지 않습니다.
 - JSON 정수는 JavaScript 안전 정수 범위 `±(2^53 − 1)`를 넘으면 클라이언트에서 정밀도를 잃습니다. 서버는 64비트 정수를 그대로 JSON 숫자로 보내지만, JavaScript의 `JSON.parse`는 숫자를 double로 읽기 때문입니다(`docs/prd/final.md` § Phase 3, 응답).
+- `SIGKILL`처럼 서버가 처리할 수 없는 종료는 쓰는 중이던 INSERT의 record를 잘라 남길 수 있고, 그러면 다음 시작이 멈춥니다. SIGINT는 실행 중인 작업을 끝까지 기다립니다([`docs/prd/issues/12-server-shutdown.md`](docs/prd/issues/12-server-shutdown.md)).
 
 ## 파일 트리
 
