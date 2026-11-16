@@ -205,7 +205,7 @@ def nul_byte_in_sql_file_exits_1():
 
 
 META_INSERT = re.compile(r"^-- 1 record inserted, id [0-9]+$")
-META_SELECT = re.compile(r"^-- [0-9]+ records?, SCAN, examined [0-9]+, [0-9]+\.[0-9]{2} ms$")
+META_SELECT = re.compile(r"^-- [0-9]+ records?, (SCAN|INDEX), examined [0-9]+, [0-9]+\.[0-9]{2} ms$")
 
 
 def meta_lines_go_to_stderr_one_per_statement():
@@ -222,7 +222,7 @@ def meta_lines_go_to_stderr_one_per_statement():
         assert lines[0] == "-- 1 record inserted, id 1", lines
         assert lines[1] == "-- 1 record inserted, id 2", lines
         assert META_SELECT.match(lines[2]), lines
-        assert lines[2].startswith("-- 1 record, SCAN, examined 2, "), lines
+        assert lines[2].startswith("-- 1 record, INDEX, examined 1, "), lines
         assert lines[3].startswith("-- 2 records, SCAN, examined 2, "), lines
     finally:
         shutil.rmtree(data_dir)
@@ -245,6 +245,29 @@ def rerun_keeps_records_and_next_id_is_4():
                                b"2\tb\tb@x\t2\n"
                                b"3\tc\tc@x\t3\n"
                                b"4\td\td@x\t4\n"), proc.stdout
+    finally:
+        shutil.rmtree(data_dir)
+
+
+def rerun_finds_same_record_by_id_through_index():
+    data_dir = make_data_dir()
+    try:
+        proc = run_sql(data_dir,
+                       "INSERT INTO users VALUES ('a', 'a@x', 1);\n"
+                       "INSERT INTO users VALUES ('b', 'b@x', 2);\n"
+                       "INSERT INTO users VALUES ('c', 'c@x', 3);\n")
+        assert proc.returncode == 0, proc.stderr
+        proc = run_sql(data_dir,
+                       "SELECT * FROM users WHERE id = 2;\n"
+                       "SELECT * FROM users WHERE id = 4;\n")
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == (b"id\tname\temail\tage\n"
+                               b"2\tb\tb@x\t2\n"
+                               b"id\tname\temail\tage\n"), proc.stdout
+        lines = proc.stderr.decode("utf-8").splitlines()
+        assert len(lines) == 2, lines
+        assert lines[0].startswith("-- 1 record, INDEX, examined 1, "), lines
+        assert lines[1].startswith("-- 0 records, INDEX, examined 0, "), lines
     finally:
         shutil.rmtree(data_dir)
 
@@ -384,6 +407,8 @@ TESTS = [
      failed_write_exits_1_and_keeps_table_file),
     ("INSERT 세 개 뒤 CLI를 다시 실행하면 세 record가 조회되고 다음 INSERT는 ID 4를 받는다",
      rerun_keeps_records_and_next_id_is_4),
+    ("[T108] CLI를 다시 실행해도 WHERE id = k는 INDEX로 같은 record를 찾고, 없는 ID는 INDEX로 0건이다",
+     rerun_finds_same_record_by_id_through_index),
     ("다른 프로세스가 데이터 폴더를 잠근 동안 CLI는 종료 코드 1로 끝나고, 잠금이 풀리면 실행된다",
      locked_data_dir_exits_1_until_lock_is_released),
     ("dump는 같은 테이블의 SELECT *와 같은 TSV를 출력한다",

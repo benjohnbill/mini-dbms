@@ -11,6 +11,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "bptree.h"
+
 /* 테이블 파일의 레이아웃입니다. record = 본문 길이(u32) + 본문,
    본문 = id(i64) + 스키마 순서의 field 값. INT는 i64, TEXT는 길이(u32) +
    UTF-8 바이트입니다. 모든 정수는 리틀 엔디언입니다. */
@@ -29,6 +31,13 @@ struct table_scan {
     char *body;
     size_t body_capacity;
     struct value *values;
+};
+
+/* INDEX iterator입니다. scan이 첫 칸이라 SCAN과 같은 읽기와 해제를 그대로
+   씁니다. scan.offset은 트리에서 찾은 record의 offset입니다. */
+struct table_index {
+    struct table_scan scan;
+    bool found;
 };
 
 struct table_file_functions table_file_functions = {
@@ -55,7 +64,7 @@ static int schema_type_parse(const char *type_name, enum value_type *type);
 static bool schema_has_field(const struct table *table, const char *name);
 static int table_records_load(struct table *table, const char *path,
                               char *error, size_t error_size);
-static int records_check(const struct table *table, struct damage *damage,
+static int records_check(struct table *table, struct damage *damage,
                          int64_t *last_id);
 static void damage_set(struct damage *damage, const char *kind,
                        const char *reason);
@@ -74,6 +83,7 @@ static int write_full(int fd, const unsigned char *bytes, size_t size,
                       uint64_t offset);
 static int scan_next(struct record_iterator *iterator, struct record *record);
 static void scan_destroy(struct record_iterator *iterator);
+static int index_next(struct record_iterator *iterator, struct record *record);
 static int read_full(int fd, void *bytes, size_t size, uint64_t offset);
 static int scan_decode_body(struct table_scan *scan, uint32_t body_len,
                             struct record *record);
@@ -93,8 +103,9 @@ struct table *table_create(const char *data_dir, const char *name, char *error,
     }
     table->fd = -1;
     table->name = strdup(name);
+    table->tree = bptree_create();
     snprintf(path, sizeof(path), "%s/%s.schema", data_dir, name);
-    if (table->name == NULL ||
+    if (table->name == NULL || table->tree == NULL ||
         schema_load(table, path, error, error_size) != 0) {
         table_destroy(table);
         return NULL;
@@ -131,6 +142,7 @@ void table_destroy(struct table *table)
     }
     free(table->fields);
     free(table->name);
+    bptree_destroy(table->tree);
     free(table);
 }
 
@@ -150,9 +162,15 @@ enum table_insert_status table_insert(struct table *table,
         return TABLE_INSERT_ID_EXHAUSTED;
     }
     new_id = table->last_id + 1;
-    /* 1단계: 파일을 건드리기 전에 메모리 할당을 모두 끝냅니다. */
+    /* 1단계: 파일을 건드리기 전에 메모리 할당을 모두 끝냅니다. record 버퍼와
+       3단계의 트리 삽입이 쓸 노드입니다. */
     bytes = table_file_functions.allocate(size);
     if (bytes == NULL) {
+        error_set(error, error_size, "out of memory");
+        return TABLE_INSERT_OUT_OF_MEMORY;
+    }
+    if (bptree_reserve(table->tree) != 0) {
+        free(bytes);
         error_set(error, error_size, "out of memory");
         return TABLE_INSERT_OUT_OF_MEMORY;
     }
@@ -176,7 +194,10 @@ enum table_insert_status table_insert(struct table *table,
         return TABLE_INSERT_STORAGE_ERROR;
     }
     free(bytes);
-    /* 3단계: 쓰기가 모두 끝난 뒤에만 파일 끝 위치와 ID를 올립니다. */
+    /* 3단계: 쓰기가 모두 끝난 뒤에만 트리에 id → 쓰기 전 committed_size를
+       넣고, 파일 끝 위치와 ID를 올립니다. 1단계에서 노드를 할당했으므로
+       트리 삽입은 실패하지 않습니다. */
+    bptree_insert(table->tree, new_id, table->committed_size);
     table->committed_size += size;
     table->last_id = new_id;
     *inserted_id = new_id;
@@ -201,6 +222,28 @@ struct record_iterator *table_scan_create(struct table *table)
     scan->table = table;
 
     return &scan->iterator;
+}
+
+struct record_iterator *table_index_create(struct table *table,
+                                           int64_t target_id)
+{
+    struct table_index *index = calloc(1, sizeof(*index));
+
+    if (index == NULL) {
+        return NULL;
+    }
+    index->scan.values =
+        calloc(table->field_count + 1, sizeof(*index->scan.values));
+    if (index->scan.values == NULL) {
+        free(index);
+        return NULL;
+    }
+    index->scan.iterator.next = index_next;
+    index->scan.iterator.destroy = scan_destroy;
+    index->scan.table = table;
+    index->found = bptree_find(table->tree, target_id, &index->scan.offset);
+
+    return &index->scan.iterator;
 }
 
 static void error_set(char *error, size_t error_size, const char *format, ...)
@@ -317,6 +360,7 @@ static bool schema_has_field(const struct table *table, const char *name)
 }
 
 /* 시작할 때 테이블 파일을 처음부터 끝까지 한 번 읽어 가장 큰 ID를 찾고,
+   B+ 트리에 record마다 id → offset을 넣습니다. 인덱스 파일은 없습니다.
    깨진 record가 있으면 잘림인지 손상인지 알리고 멈춥니다. 파일은 고치지
    않습니다. 주석의 규칙 번호는 docs/prd/issues/04-detect-damaged-table-file.md
    § 판정 규칙의 번호입니다. */
@@ -345,9 +389,10 @@ static int table_records_load(struct table *table, const char *path,
     return 0;
 }
 
-/* committed_size까지 record를 차례로 확인합니다. 깨진 record를 찾으면
-   *damage를 채우고 0을 돌려줍니다. 읽기 오류와 메모리 부족은 -1입니다. */
-static int records_check(const struct table *table, struct damage *damage,
+/* committed_size까지 record를 차례로 확인하고 성한 record를 트리에 넣습니다.
+   깨진 record를 찾으면 *damage를 채우고 0을 돌려줍니다. 읽기 오류와 메모리
+   부족은 -1입니다. */
+static int records_check(struct table *table, struct damage *damage,
                          int64_t *last_id)
 {
     uint64_t offset = 0;
@@ -413,8 +458,13 @@ static int records_check(const struct table *table, struct damage *damage,
             damage_set(damage, "손상", "field가 본문 길이와 맞지 않음");
         } else if (get_i64(body) <= *last_id) { /* 규칙 6 */
             damage_set(damage, "손상", "id가 앞 record의 id보다 크지 않음");
+        } else if (bptree_reserve(table->tree) != 0) {
+            errno = ENOMEM;
+            status = -1;
+            break;
         } else {
             *last_id = get_i64(body);
+            bptree_insert(table->tree, *last_id, offset);
             offset += LENGTH_BYTES + body_len; /* 규칙 7 */
         }
     }
@@ -592,6 +642,18 @@ static void scan_destroy(struct record_iterator *iterator)
     free(scan->body);
     free(scan->values);
     free(scan);
+}
+
+/* 트리에서 찾은 record 하나를 SCAN과 같은 방법으로 읽고 끝납니다. */
+static int index_next(struct record_iterator *iterator, struct record *record)
+{
+    struct table_index *index = (struct table_index *)iterator;
+
+    if (!index->found) {
+        return 0;
+    }
+    index->found = false;
+    return scan_next(iterator, record);
 }
 
 static int read_full(int fd, void *bytes, size_t size, uint64_t offset)

@@ -57,6 +57,8 @@ static bool table_find_field(const struct table *table, const char *name,
 static int where_check(struct engine_result *result, const struct table *table,
                        const struct statement *statement, size_t *where_source);
 static struct value record_field(const struct record *record, size_t source);
+static enum engine_access_path select_plan(const struct statement *statement,
+                                           size_t where_source);
 static const char *value_type_name(enum value_type type);
 static bool value_equal(const struct value *left, const struct value *right);
 static enum engine_error_reason
@@ -406,14 +408,17 @@ static void execute_select(struct table *table,
     int status;
 
     result->kind = ENGINE_STATEMENT_SELECT;
-    result->access_path = ENGINE_ACCESS_PATH_SCAN;
     if (sources == NULL) {
         result_fail(result, ENGINE_REASON_OUT_OF_MEMORY, "메모리가 부족합니다");
         return;
     }
     if (result_set_fields(result, table, statement, sources) == 0 &&
         where_check(result, table, statement, &where_source) == 0) {
-        iterator = table_scan_create(table);
+        result->access_path = select_plan(statement, where_source);
+        iterator =
+            result->access_path == ENGINE_ACCESS_PATH_INDEX
+                ? table_index_create(table, statement->where_value.integer)
+                : table_scan_create(table);
         if (iterator == NULL) {
             result_fail(result, ENGINE_REASON_OUT_OF_MEMORY,
                         "메모리가 부족합니다");
@@ -427,7 +432,10 @@ static void execute_select(struct table *table,
         struct value field;
 
         result->records_examined++;
-        if (statement->where_field != NULL) {
+        /* INDEX로 찾은 record는 조건과 다시 비교하지 않습니다. 정확성은 B+
+           트리 단위 테스트가 보증합니다. */
+        if (result->access_path == ENGINE_ACCESS_PATH_SCAN &&
+            statement->where_field != NULL) {
             field = record_field(&record, where_source);
             if (!value_equal(&field, &statement->where_value)) {
                 continue;
@@ -490,6 +498,17 @@ static int where_check(struct engine_result *result, const struct table *table,
         return -1;
     }
     return 0;
+}
+
+/* where_check를 통과한 SELECT의 접근 경로입니다. 조건이 id = 정수이면
+   INDEX, 그 밖은 SCAN입니다. */
+static enum engine_access_path select_plan(const struct statement *statement,
+                                           size_t where_source)
+{
+    if (statement->where_field != NULL && where_source == 0) {
+        return ENGINE_ACCESS_PATH_INDEX;
+    }
+    return ENGINE_ACCESS_PATH_SCAN;
 }
 
 static const char *value_type_name(enum value_type type)
